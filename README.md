@@ -49,3 +49,17 @@ def play_meme_forge():
 
 if __name__ == "__main__":
     play_meme_forge()
+
+
+
+demorepo/
+├── README.md
+├── .gitignore
+├── requirements.txt
+├── meme_forge/
+│   ├── __init__.py
+│   ├── game.py        # your current code, refactored
+│   └── scores.py      # high score logic
+└── tests/
+    └── test_game.py
+    
