@@ -1,0 +1,2723 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         HALL PASS TO HELL  —  v4.0  (Final Edition)                        ║
+║         School Architecture · Click Sounds · Floor Gate · Customizer       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  HOW TO RUN:                                                                ║
+║    Spyder  → open file → press F5                                           ║
+║    Terminal→ python hall_pass_to_hell_v4.py                                 ║
+║                                                                             ║
+║  REQUIREMENTS:  pip install pygame numpy                                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+WHAT'S NEW IN v4.0
+──────────────────
+  ① Immersive school architecture renderer
+       • SchoolArchitecture class draws full hallway perspective scenes
+       • Each floor zone (Floors 1-3, 4-6, 7-8, 9-10) has unique visual theme:
+           Trust Zone   — warm fluorescent lights, clean lockers, posters
+           Doubt Zone   — flickering lights, graffiti, peeling paint
+           Paranoia Zone— broken windows, police tape, overgrown floor
+           Endgame Zone — structural collapse, emergency lighting, void doors
+       • Procedural locker rows, ceiling tiles, floor tiles, notice boards
+       • Animated environmental details: flickering bulbs, swinging door, dust motes
+
+  ② Per-click contextual sound system (27 distinct sounds)
+       • Click sounds rotate through 6 variants keyed to UI context
+       • Button hover: whisper tick (≠ click, avoids over-saturation)
+       • Task buttons: heavy chalk thunk
+       • Vote buttons: institutional bell fragment
+       • Navigation buttons: door-creak + footstep combo
+       • Success/fail audio layers added on top of base click
+       • No two consecutive clicks ever play the same sound
+
+  ③ Floor progression gate
+       • GameState.floor_unlocked tracks per-floor completion status
+       • FloorScene shows locked overlay if mini-task not yet completed
+       • "Advance Floor" button is DISABLED and grayed with explanation
+         until current floor's mini-task earns its clue bonus
+       • LobbyScene shows lock icon and "Complete the floor task first" notice
+       • Engine.can_advance_floor() → bool used by all transition points
+
+  ④ Character customizer with Studs option + full integration
+       • CustomizeScene: tabbed panel (Face · Hair · Outfit · Studs · Preview)
+       • Studs tab: piercing placement picker (ear, nose, lip, eyebrow, septum)
+         each with colour picker (gold, silver, rose-gold, black, gemstone)
+       • Human player config persisted in GameState.human_config
+       • SpriteFactory.draw_studs() renderer integrated into main draw pipeline
+       • Accessible from lobby via "Customize" button (non-modal, returns to lobby)
+       • NPC studs visible in vote/lobby screens for character variety
+"""
+
+import pygame
+import numpy as np
+import random
+import math
+import time
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Any
+from enum import Enum
+from abc import ABC, abstractmethod
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CONSTANTS & PALETTE
+# ═══════════════════════════════════════════════════════════════════════
+
+W, H   = 1200, 760
+FPS    = 60
+TITLE  = "HALL PASS TO HELL  v4.0"
+
+C = {
+    "bg":       (12,  12,  18),
+    "surface":  (22,  22,  34),
+    "surface2": (32,  32,  52),
+    "surface3": (42,  42,  68),
+    "border":   (52,  52,  80),
+    "accent":   (120, 112, 230),
+    "accent2":  (210,  82,  44),
+    "accent3":  (26,  152, 112),
+    "warn":     (182, 112,  20),
+    "text":     (228, 228, 240),
+    "text2":    (140, 140, 172),
+    "text3":    (82,   82, 116),
+    "red":      (222,  70,  70),
+    "white":    (255, 255, 255),
+    "black":    (0,    0,   0),
+    "yellow":   (238, 206,  56),
+    "lime":     (116, 218,  74),
+    "pink":     (218,  76, 158),
+    "teal":     (36,  196, 196),
+    "gold":     (212, 172,  48),
+    "silver":   (192, 192, 208),
+    "rose":     (220, 152, 152),
+    "locked":   (80,   40,  40),
+    "unlocked": (40,   80,  50),
+}
+
+FONTS: Dict[str, pygame.font.Font] = {}
+
+# ── Floor zone definitions ──────────────────────────────────────────
+FLOOR_ZONES = {
+    "trust":    {"floors": range(1, 4),  "label": "Trust Phase",
+                 "wall": (38,42,62), "floor_col": (28,28,42), "ceiling": (22,24,36),
+                 "light": (255,240,180), "light_alpha": 80},
+    "doubt":    {"floors": range(4, 7),  "label": "Doubt Phase",
+                 "wall": (44,36,36), "floor_col": (32,24,24), "ceiling": (26,20,20),
+                 "light": (255,200,100), "light_alpha": 55},
+    "paranoia": {"floors": range(7, 9),  "label": "Paranoia Phase",
+                 "wall": (30,38,30), "floor_col": (20,28,20), "ceiling": (16,22,16),
+                 "light": (180,255,180), "light_alpha": 40},
+    "endgame":  {"floors": range(9, 11), "label": "No One Is Safe",
+                 "wall": (20,16,28), "floor_col": (14,12,20), "ceiling": (10,8,16),
+                 "light": (200,160,255), "light_alpha": 30},
+}
+
+def zone_for_floor(fl: int) -> dict:
+    for z in FLOOR_ZONES.values():
+        if fl in z["floors"]:
+            return z
+    return FLOOR_ZONES["trust"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PROCEDURAL SOUND ENGINE  — 27 sounds, zero external files
+# ═══════════════════════════════════════════════════════════════════════
+
+SR = 44100
+
+def _arr(dur: float, fn) -> np.ndarray:
+    n = int(SR * dur)
+    t = np.linspace(0, dur, n, False)
+    return np.clip(fn(t), -1, 1).astype(np.float32)
+
+def _to_int16(arr) -> np.ndarray:
+    return (np.clip(arr, -1, 1) * 32767).astype(np.int16)
+
+def _env(t, a=0.01, d=0.05, s=0.7, r=0.1, total=None):
+    total = total or float(t[-1])
+    e = np.ones_like(t)
+    for i, ti in enumerate(t):
+        if   ti < a:         e[i] = ti / a
+        elif ti < a+d:       e[i] = 1.0 - (1-s)*((ti-a)/d)
+        elif ti < total-r:   e[i] = s
+        else:                e[i] = s * max(0.0, (total-ti)/r)
+    return e
+
+def _reverb(arr, delay=2200, decay=0.3):
+    out = arr.astype(np.float32).copy()
+    for i in range(delay, len(out)):
+        out[i] += out[i-delay] * decay
+    return _to_int16(out / max(1, abs(out).max()) * 0.95)
+
+class SoundEngine:
+    """
+    27-sound procedural synthesiser.
+    Context-aware click rotation: tracks last-played per context key
+    so no two consecutive clicks in the same context repeat.
+    """
+    def __init__(self):
+        pygame.mixer.set_num_channels(20)
+        self.sounds: Dict[str, Optional[pygame.Sound]] = {}
+        self._ch   = 0
+        self._last: Dict[str, str] = {}    # context → last sound name
+        self._build_all()
+
+    # ── Playback ──────────────────────────────────────────────────────
+    def play(self, name: str, vol: float = 0.55):
+        snd = self.sounds.get(name)
+        if not snd: return
+        ch = pygame.mixer.Channel(self._ch % 18)
+        self._ch += 1
+        ch.set_volume(min(1.0, vol))
+        try: ch.play(snd)
+        except Exception: pass
+
+    def play_ctx(self, context: str, vol: float = 0.55):
+        """
+        Play a click sound appropriate to `context`, never repeating
+        the same variant twice in a row.
+        Contexts: 'nav' | 'task' | 'vote' | 'ui' | 'danger' | 'success'
+        """
+        pools = {
+            "nav":     ["door_creak", "footstep", "click_soft"],
+            "task":    ["chalk_thunk","click_hard","chalk_squeak"],
+            "vote":    ["bell_frag",  "vote_cast", "click_eerie"],
+            "ui":      ["click_soft", "click_soft2","click_soft3"],
+            "danger":  ["click_eerie","sabotage_stab","click_hard"],
+            "success": ["task_ping",  "uniform_snap","wire_connect"],
+        }
+        pool = pools.get(context, ["click_soft"])
+        last = self._last.get(context)
+        choices = [s for s in pool if s != last] or pool
+        chosen  = random.choice(choices)
+        self._last[context] = chosen
+        self.play(chosen, vol)
+
+    def start_music(self):
+        snd = self.sounds.get("music")
+        if snd:
+            ch = pygame.mixer.Channel(19)
+            ch.set_volume(0.14)
+            try: ch.play(snd, loops=-1)
+            except Exception: pass
+
+    def stop_music(self):
+        try: pygame.mixer.Channel(19).stop()
+        except Exception: pass
+
+    # ── Synthesis ─────────────────────────────────────────────────────
+    def _build_all(self):
+        recipes = {
+            # ── 6 UI click variants ──────────────────────────────────
+            "click_soft":   self._click_soft,
+            "click_soft2":  self._click_soft2,
+            "click_soft3":  self._click_soft3,
+            "click_hard":   self._click_hard,
+            "click_eerie":  self._click_eerie,
+            "hover":        self._hover,
+            # ── Navigation context ───────────────────────────────────
+            "door_creak":   self._door_creak,
+            "footstep":     self._footstep,
+            # ── Task context ─────────────────────────────────────────
+            "chalk_thunk":  self._chalk_thunk,
+            "chalk_squeak": self._chalk_squeak,
+            "chalk_erase":  self._chalk_erase,
+            # ── Vote context ─────────────────────────────────────────
+            "bell_frag":    self._bell_frag,
+            "vote_cast":    self._vote_cast,
+            # ── Game events ──────────────────────────────────────────
+            "success":      self._success,
+            "sabotage":     self._sabotage,
+            "sabotage_stab":self._sabotage_stab,
+            "eject_good":   self._eject_good,
+            "eject_bad":    self._eject_bad,
+            "floor_up":     self._floor_up,
+            "floor_locked": self._floor_locked,
+            "win":          self._win,
+            "lose":         self._lose,
+            # ── Mini-task specific ───────────────────────────────────
+            "light_click":  self._light_click,
+            "light_buzz":   self._light_buzz,
+            "uniform_snap": self._uniform_snap,
+            "wire_connect": self._wire_connect,
+            "lock_click":   self._lock_click,
+            "task_ping":    self._task_ping,
+            "task_fail":    self._task_fail,
+            # ── Character customizer ─────────────────────────────────
+            "stud_place":   self._stud_place,
+            "stud_remove":  self._stud_remove,
+            # ── Atmosphere ───────────────────────────────────────────
+            "heartbeat":    self._heartbeat,
+            "blink_tick":   self._blink_tick,
+            "music":        self._music,
+        }
+        for name, fn in recipes.items():
+            try:
+                arr = fn()
+                self.sounds[name] = pygame.sndarray.make_sound(arr)
+            except Exception:
+                self.sounds[name] = None
+
+    # ── Individual synthesisers ───────────────────────────────────────
+    def _click_soft(self):
+        d=0.07; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*820*t)*_env(t,.001,.018,0,.045,d)*.38))
+    def _click_soft2(self):
+        d=0.08; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*680*t)*_env(t,.001,.022,0,.05,d)*.34))
+    def _click_soft3(self):
+        d=0.09; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*900*t)*.18+np.sin(2*np.pi*450*t)*.14)*
+            _env(t,.001,.02,0,.055,d)))
+    def _click_hard(self):
+        d=0.11; rng=np.random.default_rng(1)
+        return _to_int16(_arr(d,lambda t:
+            (np.sign(np.sin(2*np.pi*420*t))*.26+rng.uniform(-.07,.07,len(t)))*
+            _env(t,.001,.028,0,.075,d)))
+    def _click_eerie(self):
+        d=0.28; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*215*t)*.26+np.sin(2*np.pi*328*t)*.16)*
+            _env(t,.004,.055,.28,.16,d)))
+    def _hover(self):
+        d=0.04; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*1450*t)*_env(t,.001,.008,0,.022,d)*.11))
+    def _door_creak(self):
+        d=0.55; rng=np.random.default_rng(55)
+        return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*(180+60*t/d)*t)*.22+rng.uniform(-.08,.08,len(t)))*
+            _env(t,.01,.06,.35,.3,d)))
+    def _footstep(self):
+        d=0.18; rng=np.random.default_rng(22)
+        return _to_int16(_arr(d,lambda t:
+            (np.sign(np.sin(2*np.pi*80*t))*.25+rng.uniform(-.12,.12,len(t)))*
+            _env(t,.001,.025,0,.13,d)))
+    def _chalk_thunk(self):
+        d=0.14; rng=np.random.default_rng(9)
+        return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*280*t)*.3+rng.uniform(-.1,.1,len(t)))*
+            _env(t,.001,.022,0,.1,d)))
+    def _chalk_squeak(self):
+        d=0.2; rng=np.random.default_rng(30)
+        arr=_arr(d,lambda t:(np.sin(2*np.pi*(820+380*np.sin(2*np.pi*11*t))*t)*.26+
+            rng.uniform(-.13,.13,len(t)))*_env(t,.004,.028,.38,.1,d))
+        return _reverb(_to_int16(arr),2500,.18)
+    def _chalk_erase(self):
+        d=0.26; rng=np.random.default_rng(31)
+        n=rng.uniform(-1,1,int(SR*d)).astype(np.float32)
+        hp=np.diff(n,prepend=n[0])*4
+        t=np.linspace(0,d,len(hp),False)
+        return _to_int16(hp*_env(t,.018,.045,.48,.14,d)*.3)
+    def _bell_frag(self):
+        d=0.9
+        def w(t):
+            b=np.sin(2*np.pi*880*t)*.3+np.sin(2*np.pi*1760*t)*.12
+            return b*np.exp(-t*4.5)
+        return _to_int16(_arr(d,w))
+    def _vote_cast(self):
+        d=0.36; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*648*t)*.31+np.sin(2*np.pi*972*t)*.13)*
+            _env(t,.004,.085,.09,.24,d)))
+    def _success(self):
+        d=0.65
+        def w(t):
+            notes=[524,660,784,1048]; out=np.zeros_like(t); seg=d/4
+            for i,f in enumerate(notes):
+                m=(t>=i*seg)&(t<(i+1)*seg); lt=t[m]-i*seg
+                out[m]=np.sin(2*np.pi*f*lt)*.42
+            return out
+        return _to_int16(_arr(d,w))
+    def _sabotage(self):
+        d=0.52; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*(188-62*t)*t)*.36+np.sin(2*np.pi*86*t)*.16)*
+            _env(t,.01,.11,.2,.3,d)))
+    def _sabotage_stab(self):
+        d=0.22; rng=np.random.default_rng(77)
+        return _to_int16(_arr(d,lambda t:
+            (np.sign(np.sin(2*np.pi*120*t))*.32+rng.uniform(-.12,.12,len(t)))*
+            _env(t,.001,.04,0,.15,d)))
+    def _eject_good(self):
+        d=0.85
+        def w(t):
+            sw=np.sin(2*np.pi*(395+315*t/d)*t)*.27
+            ch=np.sin(2*np.pi*524*t)*.17+np.sin(2*np.pi*660*t)*.13
+            return (sw+ch)*_env(t,.01,.11,.48,.28,d)
+        return _to_int16(_arr(d,w))
+    def _eject_bad(self):
+        d=1.1; rng=np.random.default_rng(42)
+        return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*(192-80*t)*t)*.36+rng.uniform(-.08,.08,len(t)))*
+            _env(t,.004,.15,.14,.62,d)))
+    def _floor_up(self):
+        d=0.44; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*(292+212*t/d)*t)*.36*_env(t,.01,.055,.48,.2,d)))
+    def _floor_locked(self):
+        d=0.5; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*220*t)*.22+np.sin(2*np.pi*185*t)*.18)*
+            _env(t,.005,.08,.3,.28,d)))
+    def _win(self):
+        d=2.2
+        def w(t):
+            mel=[524,660,784,660,784,1048]; out=np.zeros_like(t); seg=d/6
+            for i,f in enumerate(mel):
+                m=(t>=i*seg)&(t<(i+1)*seg); lt=t[m]-i*seg
+                out[m]=np.sin(2*np.pi*f*lt)*.36+np.sin(2*np.pi*f*2*lt)*.08
+            return out*_env(t,.01,.11,.68,.52,d)
+        return _to_int16(_arr(d,w))
+    def _lose(self):
+        d=2.2; rng=np.random.default_rng(7)
+        return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*(246-96*t/d)*t)*.32+np.sin(2*np.pi*(123-38*t/d)*t)*.17+
+             rng.uniform(-.04,.04,len(t)))*_env(t,.02,.2,.28,.82,d)))
+    def _light_click(self):
+        d=0.1; return _to_int16(_arr(d,lambda t:
+            np.sign(np.sin(2*np.pi*312*t))*_env(t,.001,.014,0,.068,d)*.44))
+    def _light_buzz(self):
+        d=0.6; rng=np.random.default_rng(10)
+        arr=_arr(d,lambda t:
+            (np.sin(2*np.pi*120*t)*.21+np.sin(2*np.pi*240*t)*.07+
+             rng.uniform(-.05,.05,len(t)))*(0.6+0.4*np.sin(2*np.pi*8*t)))
+        return _reverb(_to_int16(arr),1800,.26)
+    def _uniform_snap(self):
+        d=0.13; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*1820*t)*.38+np.sin(2*np.pi*910*t)*.18)*
+            _env(t,.001,.018,0,.095,d)))
+    def _wire_connect(self):
+        d=0.2; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*1180*t)*.28+np.sin(2*np.pi*1770*t)*.13)*
+            _env(t,.002,.028,0,.15,d)))
+    def _lock_click(self):
+        d=0.08; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*548*t)*_env(t,.001,.01,0,.052,d)*.43))
+    def _task_ping(self):
+        d=0.52; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*876*t)*.33+np.sin(2*np.pi*1314*t)*.18)*
+            _env(t,.003,.048,.38,.35,d)))
+    def _task_fail(self):
+        d=0.44; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*158*t)*.33+np.sin(2*np.pi*138*t)*.23)*
+            _env(t,.004,.095,.18,.26,d)))
+    def _stud_place(self):
+        d=0.16; return _to_int16(_arr(d,lambda t:
+            (np.sin(2*np.pi*2200*t)*.2+np.sin(2*np.pi*3300*t)*.1)*
+            _env(t,.001,.015,0,.12,d)))
+    def _stud_remove(self):
+        d=0.12; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*1600*t)*_env(t,.001,.01,0,.09,d)*.18))
+    def _heartbeat(self):
+        d=0.85
+        def w(t):
+            out=np.zeros_like(t)
+            for bt in [0.1,0.36]:
+                diff=t-bt; mask=(diff>=0)&(diff<0.22)
+                out[mask]+=np.sin(2*np.pi*54*diff[mask])*np.exp(-diff[mask]*17)*.52
+            return out
+        return _to_int16(_arr(d,w))
+    def _blink_tick(self):
+        d=0.06; return _to_int16(_arr(d,lambda t:
+            np.sin(2*np.pi*2180*t)*_env(t,.001,.007,0,.038,d)*.13))
+    def _music(self):
+        d=10.0; rng=np.random.default_rng(99)
+        def w(t):
+            root =np.sin(2*np.pi*73.4*t)*.16
+            fifth=np.sin(2*np.pi*110.0*t)*.09
+            third=np.sin(2*np.pi*87.3*t)*.07*(0.5+0.5*np.sin(2*np.pi*.22*t))
+            sub  =np.sin(2*np.pi*36.7*t)*.07
+            noise=rng.uniform(-.011,.011,len(t))
+            swell=0.75+0.25*np.sin(2*np.pi*.08*t)
+            return (root+fifth+third+sub+noise)*swell
+        arr=_to_int16(_arr(d,w))
+        return _reverb(arr,4200,.16)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SCHOOL ARCHITECTURE RENDERER
+# ═══════════════════════════════════════════════════════════════════════
+
+class SchoolArchitecture:
+    """
+    Draws a full hallway perspective scene for each floor zone.
+    Used as the background in FloorScene and MiniTaskScene.
+    Procedurally generated — zero external assets.
+    """
+
+    def __init__(self):
+        self._env_t = 0.0          # time for animated elements
+        self._dust  : List[dict] = []
+        self._door_swing = 0.0     # door animation angle
+        self._door_dir   = 1
+        self._gen_dust()
+
+    def _gen_dust(self):
+        self._dust = [{"x": random.uniform(200,W-200),
+                       "y": random.uniform(200,H-200),
+                       "vy": random.uniform(-0.4,-0.1),
+                       "vx": random.uniform(-0.15,0.15),
+                       "r":  random.uniform(1,3),
+                       "a":  random.randint(15,55)}
+                      for _ in range(28)]
+
+    def update(self, dt: float, floor: int):
+        self._env_t += dt
+        # Door swings slowly
+        self._door_swing += dt * 0.5 * self._door_dir
+        if self._door_swing > 0.22: self._door_dir = -1
+        if self._door_swing < 0.0:  self._door_dir =  1
+        # Drift dust motes
+        for d in self._dust:
+            d["x"] += d["vx"]; d["y"] += d["vy"]
+            if d["y"] < 80:   d["y"] = H - 80
+            if d["x"] < 50:   d["x"] = W - 50
+            if d["x"] > W-50: d["x"] = 50
+
+    def draw(self, surf: pygame.Surface, floor: int, alpha_overlay: int = 0):
+        """
+        Draw the full hallway perspective onto surf.
+        alpha_overlay: 0=full draw, >0=darken for foreground content
+        """
+        zone = zone_for_floor(floor)
+        wc   = zone["wall"]
+        fc   = zone["floor_col"]
+        cc   = zone["ceiling"]
+        lc   = zone["light"]
+        la   = zone["light_alpha"]
+
+        # ── Background gradient (walls) ──────────────────────────────
+        for y in range(H):
+            t = y / H
+            r = int(wc[0]*(1-t*0.3))
+            g = int(wc[1]*(1-t*0.3))
+            b = int(wc[2]*(1-t*0.3))
+            pygame.draw.line(surf,(r,g,b),(0,y),(W,y))
+
+        # ── Perspective floor ─────────────────────────────────────────
+        vp_x, vp_y = W//2, H//2
+        floor_y = int(H * 0.72)
+        self._draw_floor(surf, fc, floor_y, floor)
+
+        # ── Ceiling ───────────────────────────────────────────────────
+        self._draw_ceiling(surf, cc, floor_y, floor)
+
+        # ── Left wall (locker bank) ───────────────────────────────────
+        self._draw_lockers(surf, wc, floor)
+
+        # ── Right wall (notice board + doors) ────────────────────────
+        self._draw_right_wall(surf, wc, floor)
+
+        # ── Ceiling lights ────────────────────────────────────────────
+        self._draw_lights(surf, lc, la, floor)
+
+        # ── Perspective vanishing point lines ─────────────────────────
+        self._draw_perspective_lines(surf, wc, floor_y)
+
+        # ── Zone-specific details ─────────────────────────────────────
+        if floor >= 4:   self._draw_graffiti(surf, floor)
+        if floor >= 7:   self._draw_cracks(surf, floor)
+        if floor >= 9:   self._draw_void_elements(surf, floor)
+
+        # ── Animated door ─────────────────────────────────────────────
+        self._draw_door(surf, wc, floor_y)
+
+        # ── Dust motes ────────────────────────────────────────────────
+        for d in self._dust:
+            try:
+                ds = pygame.Surface((int(d["r"]*2+2),int(d["r"]*2+2)),pygame.SRCALPHA)
+                pygame.draw.circle(ds,(255,255,240,d["a"]),
+                                   (int(d["r"])+1,int(d["r"])+1),int(d["r"]))
+                surf.blit(ds,(int(d["x"]-d["r"]),int(d["y"]-d["r"])))
+            except Exception: pass
+
+        # ── Dark overlay to keep foreground UI readable ───────────────
+        if alpha_overlay > 0:
+            ov = pygame.Surface((W,H)); ov.set_alpha(alpha_overlay)
+            ov.fill(C["bg"]); surf.blit(ov,(0,0))
+
+    def _draw_floor(self, surf, fc, floor_y, floor):
+        # Tiled floor with perspective
+        vp_x = W//2
+        for row in range(14):
+            t  = (row+1)/14
+            y1 = floor_y + int(row*(H-floor_y)/14)
+            y2 = floor_y + int((row+1)*(H-floor_y)/14)
+            tile_col = fc if row%2==0 else tuple(min(255,c+10) for c in fc)
+            pygame.draw.rect(surf, tile_col, (0,y1,W,y2-y1))
+            # Grout line
+            pygame.draw.line(surf, tuple(max(0,c-12) for c in fc),(0,y1),(W,y1),1)
+        # Vertical grout lines (perspective)
+        for xi in range(0,16):
+            t  = xi/15
+            x  = int(t*W)
+            dx = int((x - vp_x) * 0.15)
+            pygame.draw.line(surf, tuple(max(0,c-8) for c in fc),
+                             (vp_x, floor_y),(x, H),1)
+
+    def _draw_ceiling(self, surf, cc, floor_y, floor):
+        ceiling_y = int(H * 0.18)
+        for row in range(8):
+            y1 = ceiling_y + row*int((floor_y//2-ceiling_y)/8)
+            y2 = ceiling_y + (row+1)*int((floor_y//2-ceiling_y)/8)
+            tc = cc if row%2==0 else tuple(min(255,c+8) for c in cc)
+            pygame.draw.rect(surf, tc, (0,y1,W,y2-y1))
+            pygame.draw.line(surf, tuple(max(0,c-10) for c in cc),(0,y1),(W,y1),1)
+        # Ceiling edge
+        pygame.draw.rect(surf, tuple(max(0,c-20) for c in cc),(0,0,W,ceiling_y))
+
+    def _draw_lockers(self, surf, wc, floor):
+        # Left wall lockers (24 visible, 3-high)
+        lw_x = 0; lw_w = int(W*0.22)
+        floor_y = int(H * 0.72); ceiling_y = int(H * 0.22)
+        lh = (floor_y - ceiling_y) // 3
+        lw = lw_w // 6
+        for col in range(7):
+            for row in range(3):
+                lx = col * lw
+                ly = ceiling_y + row * lh
+                # Locker body
+                locker_col = tuple(min(255,c+8) for c in wc)
+                pygame.draw.rect(surf, locker_col, (lx,ly,lw-2,lh-2))
+                # Door frame
+                border_col = tuple(max(0,c-18) for c in wc)
+                pygame.draw.rect(surf, border_col, (lx,ly,lw-2,lh-2), 1)
+                # Handle
+                hx = lx + lw//2 - 3
+                hy = ly + lh//2
+                pygame.draw.rect(surf,(140,140,160),(hx,hy-6,6,12),border_radius=2)
+                # Combo dial
+                pygame.draw.circle(surf,(100,100,120),(lx+lw//2,ly+lh//3),5)
+                # Vent slots
+                for vi in range(3):
+                    vx = lx+4; vy = ly + 10 + vi*8
+                    pygame.draw.rect(surf, border_col,(vx,vy,lw-8,3),border_radius=1)
+                # Number label
+                num = col*3 + row + 101
+                if FONTS.get("tiny"):
+                    lbl=FONTS["tiny"].render(str(num),True,(80,80,100))
+                    surf.blit(lbl,(lx+3,ly+3))
+                # Open/damaged lockers on higher floors
+                if floor >= 5 and random.Random(col*3+row+floor).random() < 0.3:
+                    # Slightly ajar
+                    pygame.draw.rect(surf, tuple(max(0,c-25) for c in wc),
+                                     (lx+lw//2,ly+2,lw//2-4,lh-4))
+
+    def _draw_right_wall(self, surf, wc, floor):
+        rw_x = int(W * 0.82); rw_w = W - rw_x
+        floor_y = int(H * 0.72); ceiling_y = int(H * 0.22)
+
+        # Bulletin board
+        bb_y = ceiling_y + 20; bb_h = (floor_y-ceiling_y)//2 - 20
+        bb_col = (60,45,28)
+        pygame.draw.rect(surf, bb_col, (rw_x+10, bb_y, rw_w-20, bb_h))
+        pygame.draw.rect(surf, (80,60,35), (rw_x+10, bb_y, rw_w-20, bb_h), 2)
+        # Posted notices (random coloured slips)
+        rng2 = random.Random(floor*1000)
+        notice_cols = [(220,220,180),(200,240,200),(240,200,200),(200,200,240)]
+        for ni in range(6):
+            nx = rw_x + 14 + rng2.randint(0,rw_w-50)
+            ny = bb_y + 8 + rng2.randint(0,bb_h-30)
+            nc = rng2.choice(notice_cols)
+            pygame.draw.rect(surf, nc, (nx,ny,rng2.randint(24,48),rng2.randint(18,36)),
+                             border_radius=1)
+            # Pin
+            pygame.draw.circle(surf,(180,40,40),(nx+rng2.randint(8,20),ny+4),3)
+
+        # Classroom door
+        door_y = ceiling_y + bb_h + 30
+        door_h = floor_y - door_y - 10
+        door_w = min(rw_w-10, 64)
+        door_x = rw_x + (rw_w - door_w)//2
+        # Door frame
+        pygame.draw.rect(surf,(50,35,20),(door_x-4,door_y-4,door_w+8,door_h+4),
+                         border_radius=3)
+        # Door panel (animating slightly)
+        swing_x = int(math.sin(self._door_swing) * 6)
+        pygame.draw.rect(surf,(72,52,30),(door_x+swing_x,door_y,door_w-swing_x,door_h))
+        pygame.draw.rect(surf,(40,28,12),(door_x+swing_x,door_y,door_w-swing_x,door_h),1)
+        # Window pane in door
+        wp_x = door_x+swing_x+door_w//4; wp_y = door_y+door_h//5
+        wp_w = door_w//2; wp_h = door_h//4
+        pygame.draw.rect(surf,(160,200,220),(wp_x,wp_y,wp_w,wp_h))
+        pygame.draw.rect(surf,(40,28,12),(wp_x,wp_y,wp_w,wp_h),1)
+        # Door knob
+        pygame.draw.circle(surf,(160,145,60),(door_x+swing_x+door_w-10,door_y+door_h//2),5)
+
+    def _draw_lights(self, surf, lc, la, floor):
+        # Ceiling fluorescent strips
+        floor_y = int(H*0.72); ceiling_y = int(H*0.20)
+        for li in range(4):
+            lx = 120 + li * (W-240)//3
+            ly = ceiling_y + 10
+            # Flicker on higher floors
+            flicker_ok = True
+            if floor >= 5:
+                flicker_ok = abs(math.sin(self._env_t*7 + li*2.3)) > 0.25
+            if floor >= 8:
+                flicker_ok = abs(math.sin(self._env_t*11 + li*1.7)) > 0.4
+            if flicker_ok:
+                # Light cone
+                try:
+                    ls = pygame.Surface((200, floor_y-ly), pygame.SRCALPHA)
+                    r,g,b = lc
+                    pygame.draw.polygon(ls,(r,g,b,la),
+                                       [(100,0),(0,floor_y-ly),(200,floor_y-ly)])
+                    surf.blit(ls,(lx-100,ly))
+                except Exception: pass
+                # Fixture
+                pygame.draw.rect(surf,lc,(lx-40,ly-4,80,6),border_radius=2)
+                pygame.draw.rect(surf,(200,200,200),(lx-40,ly-4,80,6),1,border_radius=2)
+            else:
+                # Dark/off fixture
+                pygame.draw.rect(surf,(40,40,40),(lx-40,ly-4,80,6),border_radius=2)
+
+    def _draw_perspective_lines(self, surf, wc, floor_y):
+        vp_x,vp_y = W//2, floor_y//2
+        lc = tuple(max(0,c-20) for c in wc)
+        # Corner lines left and right
+        for x in [0, W]:
+            for y in [0, H]:
+                pygame.draw.line(surf,lc,(vp_x,vp_y),(x,y),1)
+
+    def _draw_graffiti(self, surf, floor):
+        if not FONTS.get("body"): return
+        msgs = ["BLACKWELL LIES","WHO IS #7?","SABLE WAS HERE","FLOOR 0 EXISTS",
+                "THEY WATCH US","NO EXIT","RUN","THE SCHOOL KNOWS"]
+        rng = random.Random(floor * 77)
+        for gi in range(3):
+            msg = rng.choice(msgs)
+            gx  = rng.randint(10, int(W*0.22)-40)
+            gy  = rng.randint(int(H*0.3), int(H*0.65))
+            angle = rng.uniform(-0.3, 0.3)
+            col = rng.choice([C["red"],C["warn"],C["accent"]])
+            try:
+                ts = FONTS["small"].render(msg,True,col)
+                ts.set_alpha(rng.randint(80,160))
+                surf.blit(ts,(gx,gy))
+            except Exception: pass
+
+    def _draw_cracks(self, surf, floor):
+        rng = random.Random(floor * 333)
+        for ci in range(4):
+            cx = rng.randint(0,int(W*0.22))
+            cy = rng.randint(int(H*0.22),int(H*0.72))
+            for seg in range(6):
+                ex = cx + rng.randint(-20,20)
+                ey = cy + rng.randint(-15,15)
+                pygame.draw.line(surf,(20,20,30),(cx,cy),(ex,ey),1)
+                cx,cy = ex,ey
+
+    def _draw_void_elements(self, surf, floor):
+        # Partially open "void" doorways with black beyond
+        vd_x = int(W*0.35); vd_y = int(H*0.25)
+        vd_w = 80; vd_h = int(H*0.45)
+        pygame.draw.rect(surf,(0,0,0),(vd_x,vd_y,vd_w,vd_h))
+        pygame.draw.rect(surf,(30,20,40),(vd_x,vd_y,vd_w,vd_h),2)
+        # Police tape
+        for ti in range(3):
+            ty = vd_y + ti * vd_h//3
+            pygame.draw.line(surf,C["yellow"],
+                             (vd_x-10,ty),(vd_x+vd_w+10,ty+12),3)
+        if FONTS.get("tiny"):
+            lbl=FONTS["tiny"].render("DO NOT ENTER",True,C["yellow"])
+            surf.blit(lbl,(vd_x,vd_y-14))
+
+    def _draw_door(self, surf, wc, floor_y):
+        # Animated swinging classroom door (right-center of hallway)
+        dx = int(W*0.68); dy = int(H*0.28)
+        dw = 48; dh = floor_y - dy - 20
+        sw = int(math.sin(self._door_swing*3)*8)
+        pygame.draw.rect(surf,(50,35,20),(dx-4,dy-4,dw+8+sw,dh+4),border_radius=3)
+        pygame.draw.rect(surf,(72,52,30),(dx,dy,dw+sw,dh))
+        pygame.draw.rect(surf,(40,28,12),(dx,dy,dw+sw,dh),1)
+        # Knob
+        pygame.draw.circle(surf,(160,145,60),(dx+dw+sw-8,dy+dh//2),4)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CHARACTER CUSTOMIZER WITH STUDS
+# ═══════════════════════════════════════════════════════════════════════
+
+# Default human player config (persisted across game)
+DEFAULT_PLAYER_CONFIG = {
+    "name":    "Student",
+    "skin":    (232, 168, 112),
+    "hair":    (40,  20,  8),
+    "outfit":  (120, 112, 230),
+    "acc":     "none",
+    "expr":    "neutral",
+    "studs":   [],    # list of {"slot": str, "color": tuple}
+}
+
+STUD_SLOTS = [
+    {"id":"ear_l",   "label":"Left Ear",    "bx_off":0,  "by_off":0},
+    {"id":"ear_r",   "label":"Right Ear",   "bx_off":0,  "by_off":0},
+    {"id":"nose",    "label":"Nose",        "bx_off":0,  "by_off":0},
+    {"id":"lip",     "label":"Lip",         "bx_off":0,  "by_off":0},
+    {"id":"brow_l",  "label":"Left Brow",   "bx_off":0,  "by_off":0},
+    {"id":"septum",  "label":"Septum",      "bx_off":0,  "by_off":0},
+]
+STUD_COLORS = [
+    {"id":"gold",     "label":"Gold",      "color":C["gold"]},
+    {"id":"silver",   "label":"Silver",    "color":C["silver"]},
+    {"id":"rose",     "label":"Rose Gold", "color":C["rose"]},
+    {"id":"black",    "label":"Black",     "color":(40,40,50)},
+    {"id":"gem_blue", "label":"Sapphire",  "color":(80,120,255)},
+    {"id":"gem_red",  "label":"Ruby",      "color":(220,50,80)},
+    {"id":"gem_grn",  "label":"Emerald",   "color":(50,200,100)},
+]
+
+SKIN_SWATCHES  = [(253,219,180),(245,197,147),(232,168,112),(212,132,90),
+                  (184,107,58), (141,85,36),  (107,51,24),  (61,29,10)]
+HAIR_SWATCHES  = [(26,10,0),(59,31,10),(100,52,18),(160,84,30),(200,132,58),
+                  (232,200,100),(240,240,240),(200,50,50),(80,80,220),(153,51,204)]
+OUTFIT_SWATCHES= [(120,112,230),(210,82,44),(26,152,112),(186,117,20),
+                  (13,13,13),(200,200,200),(80,120,200),(180,60,120)]
+EXPR_OPTIONS   = ["neutral","happy","smirk","suspicious","tired"]
+ACC_OPTIONS    = ["none","glasses","beanie","earring"]
+
+
+class CustomizeScene:
+    """
+    Full-screen character customizer.
+    Tabs: Face · Hair · Outfit · Studs · (preview always visible)
+    Saving writes back to game.human_config and game.engine.state.human_player().
+    """
+    TABS = ["Face","Hair","Outfit","Studs"]
+
+    def __init__(self, game):
+        self.game  = game
+        # Work on a copy; commit only on Save
+        import copy
+        hp = game.engine.state.human_player()
+        self.cfg   = copy.deepcopy(hp.sprite_cfg if hp else DEFAULT_PLAYER_CONFIG)
+        # Ensure studs key exists
+        if "studs" not in self.cfg: self.cfg["studs"] = []
+        self._tab  = "Face"
+        self._anim = AnimState()
+        self._t    = 0.0
+        self._build_buttons()
+
+    def _build_buttons(self):
+        self.btn_save = Button((W//2+40,H-60,200,44),"Save & Return",
+                               "success","head","click_soft")
+        self.btn_back = Button((W//2-240,H-60,190,44),"Cancel",
+                               "ghost","body","click_soft")
+
+    def handle_event(self, event):
+        # Tab clicks
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mx,my = event.pos
+            for i,tab in enumerate(self.TABS):
+                tx = 320 + i*160; ty = 100
+                if abs(mx-tx)<70 and abs(my-ty)<18:
+                    self._tab = tab
+                    self.game.sound.play_ctx("ui")
+                    return
+
+            # Tab-specific interactions
+            if self._tab == "Face":
+                self._handle_face(mx,my)
+            elif self._tab == "Hair":
+                self._handle_hair(mx,my)
+            elif self._tab == "Outfit":
+                self._handle_outfit(mx,my)
+            elif self._tab == "Studs":
+                self._handle_studs(mx,my)
+
+        # Save / Cancel
+        if self.btn_save.handle_event(event, self.game.sound, self.game.particles):
+            self._save()
+        if self.btn_back.handle_event(event, self.game.sound, self.game.particles):
+            self.game.switch_scene("lobby")
+
+    def _handle_face(self, mx, my):
+        # Skin swatches row at y=200
+        for i,sc in enumerate(SKIN_SWATCHES):
+            sx=320+i*44; sy=210
+            if math.hypot(mx-sx,my-sy)<17:
+                self.cfg["skin"]=sc; self.game.sound.play_ctx("ui"); return
+        # Eye colour row at y=280 (same swatches)
+        for i,sc in enumerate(SKIN_SWATCHES[:6]):
+            sx=320+i*44; sy=290
+            if math.hypot(mx-sx,my-sy)<17:
+                self.cfg["eye"]=sc; self.game.sound.play_ctx("ui"); return
+        # Expression pills y=360
+        for i,ex in enumerate(EXPR_OPTIONS):
+            rx=320+i*110; ry=355
+            if abs(mx-rx)<48 and abs(my-ry)<16:
+                self.cfg["expr"]=ex; self.game.sound.play_ctx("ui"); return
+
+    def _handle_hair(self, mx, my):
+        for i,hc in enumerate(HAIR_SWATCHES):
+            hx=320+i*44; hy=210
+            if math.hypot(mx-hx,my-hy)<17:
+                self.cfg["hair"]=hc; self.game.sound.play_ctx("ui"); return
+        # Hair style pills y=290
+        styles=["short","medium","long","braids","curly","bun","buzz","mohawk"]
+        for i,st in enumerate(styles):
+            rx=320+(i%4)*130; ry=300+(i//4)*40
+            if abs(mx-rx)<55 and abs(my-ry)<16:
+                self.cfg["hair_style"]=st; self.game.sound.play_ctx("ui"); return
+
+    def _handle_outfit(self, mx, my):
+        for i,oc in enumerate(OUTFIT_SWATCHES):
+            ox=320+i*44; oy=210
+            if math.hypot(mx-ox,my-oy)<17:
+                self.cfg["outfit"]=oc; self.game.sound.play_ctx("ui"); return
+        accs=ACC_OPTIONS
+        for i,ac in enumerate(accs):
+            rx=320+i*120; ry=295
+            if abs(mx-rx)<52 and abs(my-ry)<16:
+                self.cfg["acc"]=ac; self.game.sound.play_ctx("ui"); return
+
+    def _handle_studs(self, mx, my):
+        # Stud slot toggles (left column)
+        for i,slot in enumerate(STUD_SLOTS):
+            sy=200+i*52; sx=340
+            # Toggle slot on/off
+            if abs(mx-sx)<80 and abs(my-sy)<18:
+                existing = next((s for s in self.cfg["studs"]
+                                 if s["slot"]==slot["id"]),None)
+                if existing:
+                    self.cfg["studs"].remove(existing)
+                    self.game.sound.play("stud_remove",0.6)
+                else:
+                    # Add with current selected color (default gold)
+                    self.cfg["studs"].append({
+                        "slot":slot["id"],
+                        "color":self._selected_stud_col
+                    })
+                    self.game.sound.play("stud_place",0.6)
+                    self.game.particles.spawn_click(sx+80,sy,self._selected_stud_col)
+                return
+        # Stud colour picker (right column)
+        for i,sc in enumerate(STUD_COLORS):
+            cy=200+i*50; cx=760
+            if math.hypot(mx-cx,my-cy)<18:
+                self._selected_stud_col = sc["color"]
+                # Update colour on any active stud of no specific colour
+                self.game.sound.play_ctx("ui"); return
+
+    _selected_stud_col = C["gold"]   # class-level default
+
+    def _save(self):
+        hp = self.game.engine.state.human_player()
+        if hp:
+            hp.sprite_cfg.update(self.cfg)
+            hp.sprite_cfg["name"] = self.cfg.get("name", hp.name)
+        # Also persist in game-level config
+        self.game.human_config = dict(self.cfg)
+        self.game.switch_scene("lobby")
+
+    def update(self, dt):
+        self._t += dt
+        self._anim.update(dt, 0)
+
+    def draw(self, surf):
+        surf.fill(C["bg"])
+
+        # Left: live character preview
+        _draw_panel(surf, pygame.Rect(30,80,240,540),C["surface2"])
+        _draw_text(surf,"PREVIEW",(150,90),"small",C["text3"],"center")
+        bob = math.sin(self._t*1.2)*3
+        SpriteFactory.draw_character(
+            surf, self.cfg, 60, 140, height=160,
+            anim=self._anim, bob_offset=bob)
+        _draw_text(surf, self.cfg.get("name","Student"),
+                   (150,340),"body",C["accent"],"center")
+
+        # Name input row
+        _draw_text(surf,"Name:",(38,360),"small",C["text3"])
+        ir=pygame.Rect(38,378,222,32)
+        pygame.draw.rect(surf,C["surface"],ir,border_radius=4)
+        pygame.draw.rect(surf,C["accent"],ir,1,border_radius=4)
+        _draw_text(surf,self.cfg.get("name","Student"),(42,384),"body",C["text"])
+
+        # Tabs header
+        _draw_text(surf,"CUSTOMISE CHARACTER",
+                   (W//2,52),"title",C["accent"],"center")
+        for i,tab in enumerate(self.TABS):
+            tx=320+i*160; ty=100
+            sel = (self._tab==tab)
+            bc  = C["accent"] if sel else C["surface2"]
+            pygame.draw.rect(surf,bc,(tx-70,ty-18,140,36),border_radius=6)
+            _draw_text(surf,tab,(tx,ty-8),"head" if sel else "body",
+                       C["black"] if sel else C["text2"],"center")
+
+        pygame.draw.line(surf,C["border"],(300,125),(W-20,125),1)
+
+        # Tab content
+        content_y = 145
+        if self._tab == "Face":
+            self._draw_face_tab(surf, content_y)
+        elif self._tab == "Hair":
+            self._draw_hair_tab(surf, content_y)
+        elif self._tab == "Outfit":
+            self._draw_outfit_tab(surf, content_y)
+        elif self._tab == "Studs":
+            self._draw_studs_tab(surf, content_y)
+
+        pygame.draw.line(surf,C["border"],(20,H-74),(W-20,H-74),1)
+        self.btn_save.draw(surf)
+        self.btn_back.draw(surf)
+
+    def _swatch_row(self, surf, swatches, y, current, label):
+        _draw_text(surf,label,(310,y-18),"small",C["text3"])
+        for i,sc in enumerate(swatches):
+            sx=320+i*44; sy=y
+            sel=(self.cfg.get(label.lower().replace(" ","_")) == sc
+                 or current == sc)
+            r2=16
+            pygame.draw.circle(surf,sc,(sx,sy),r2)
+            if sel:
+                pygame.draw.circle(surf,C["white"],(sx,sy),r2+3,2)
+            pygame.draw.circle(surf,C["border"],(sx,sy),r2,1)
+
+    def _draw_face_tab(self, surf, y):
+        _draw_text(surf,"Skin Tone",(310,y),"small",C["text3"])
+        for i,sc in enumerate(SKIN_SWATCHES):
+            sel=self.cfg.get("skin")==sc
+            pygame.draw.circle(surf,sc,(320+i*44,y+22),16)
+            if sel: pygame.draw.circle(surf,C["white"],(320+i*44,y+22),19,2)
+            pygame.draw.circle(surf,C["border"],(320+i*44,y+22),16,1)
+
+        y+=60
+        _draw_text(surf,"Expression",(310,y),"small",C["text3"])
+        for i,ex in enumerate(EXPR_OPTIONS):
+            sel=self.cfg.get("expr")==ex
+            px=320+i*110; py=y+22
+            bc=C["accent"] if sel else C["surface2"]
+            pygame.draw.rect(surf,bc,(px-48,py-14,96,28),border_radius=14)
+            _draw_text(surf,ex.capitalize(),(px,py-6),"small",
+                       C["black"] if sel else C["text2"],"center")
+
+        y+=64
+        _draw_text(surf,"Eye Colour",(310,y),"small",C["text3"])
+        eye_cols=[(80,50,20),(50,80,40),(20,60,120),(120,60,20),
+                  (100,50,100),(80,80,80),(20,100,150),(160,100,40)]
+        for i,ec in enumerate(eye_cols):
+            sel=self.cfg.get("eye")==ec
+            pygame.draw.circle(surf,ec,(320+i*44,y+22),16)
+            if sel: pygame.draw.circle(surf,C["white"],(320+i*44,y+22),19,2)
+            pygame.draw.circle(surf,C["border"],(320+i*44,y+22),16,1)
+
+    def _draw_hair_tab(self, surf, y):
+        _draw_text(surf,"Hair Colour",(310,y),"small",C["text3"])
+        for i,hc in enumerate(HAIR_SWATCHES):
+            sel=self.cfg.get("hair")==hc
+            pygame.draw.circle(surf,hc,(320+i*44,y+22),16)
+            if sel: pygame.draw.circle(surf,C["white"],(320+i*44,y+22),19,2)
+            pygame.draw.circle(surf,C["border"],(320+i*44,y+22),16,1)
+
+        y+=62
+        _draw_text(surf,"Hair Style",(310,y),"small",C["text3"])
+        styles=["short","medium","long","braids","curly","bun","buzz","mohawk"]
+        for i,st in enumerate(styles):
+            sel=self.cfg.get("hair_style","medium")==st
+            px=320+(i%4)*130; py=y+22+(i//4)*42
+            bc=C["accent"] if sel else C["surface2"]
+            pygame.draw.rect(surf,bc,(px-55,py-15,110,30),border_radius=14)
+            _draw_text(surf,st.capitalize(),(px,py-7),"small",
+                       C["black"] if sel else C["text2"],"center")
+
+    def _draw_outfit_tab(self, surf, y):
+        _draw_text(surf,"Outfit Colour",(310,y),"small",C["text3"])
+        for i,oc in enumerate(OUTFIT_SWATCHES):
+            sel=self.cfg.get("outfit")==oc
+            pygame.draw.circle(surf,oc,(320+i*44,y+22),16)
+            if sel: pygame.draw.circle(surf,C["white"],(320+i*44,y+22),19,2)
+            pygame.draw.circle(surf,C["border"],(320+i*44,y+22),16,1)
+
+        y+=62
+        _draw_text(surf,"Accessory",(310,y),"small",C["text3"])
+        for i,ac in enumerate(ACC_OPTIONS):
+            sel=self.cfg.get("acc","none")==ac
+            px=320+i*130; py=y+22
+            bc=C["accent"] if sel else C["surface2"]
+            pygame.draw.rect(surf,bc,(px-55,py-15,110,30),border_radius=14)
+            _draw_text(surf,ac.capitalize(),(px,py-7),"small",
+                       C["black"] if sel else C["text2"],"center")
+
+    def _draw_studs_tab(self, surf, y):
+        _draw_text(surf,"STUD PLACEMENT",(310,y),"head",C["accent"])
+        _draw_text(surf,"Click a slot to toggle it on/off",
+                   (310,y+24),"small",C["text3"])
+
+        active_slots = {s["slot"] for s in self.cfg.get("studs",[])}
+
+        for i,slot in enumerate(STUD_SLOTS):
+            sy=y+60+i*52; sx=340
+            active=slot["id"] in active_slots
+            bc=C["accent3"] if active else C["surface2"]
+            pygame.draw.rect(surf,bc,(sx-80,sy-18,160,36),border_radius=18)
+            pygame.draw.rect(surf,C["border"],(sx-80,sy-18,160,36),1,border_radius=18)
+            # Stud dot
+            stud_col = next(
+                (s["color"] for s in self.cfg.get("studs",[])
+                 if s["slot"]==slot["id"]),
+                self._selected_stud_col)
+            pygame.draw.circle(surf,stud_col,(sx-60,sy),10)
+            pygame.draw.circle(surf,C["white"],(sx-60,sy),10,2 if active else 1)
+            _draw_text(surf,slot["label"],(sx-10,sy-8),"small",
+                       C["white"] if active else C["text2"])
+            _draw_text(surf,"ON" if active else "OFF",
+                       (sx+70,sy-8),"tiny",
+                       C["accent3"] if active else C["text3"])
+
+        # Colour picker (right side)
+        _draw_text(surf,"STUD COLOUR",(720,y),"head",C["accent"])
+        for i,sc in enumerate(STUD_COLORS):
+            cy=y+56+i*50; cx=760
+            sel=(self._selected_stud_col==sc["color"])
+            pygame.draw.circle(surf,sc["color"],(cx,cy),18)
+            if sel:
+                pygame.draw.circle(surf,C["white"],(cx,cy),22,3)
+            pygame.draw.circle(surf,C["border"],(cx,cy),18,1)
+            _draw_text(surf,sc["label"],(cx+28,cy-8),"small",C["text2"])
+
+        # Preview studs on mini-avatar
+        _draw_text(surf,"Live preview on left panel →",
+                   (380,y+380),"small",C["text3"])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ANIMATION STATE
+# ═══════════════════════════════════════════════════════════════════════
+
+class AnimState:
+    def __init__(self):
+        self.breath_t     = random.uniform(0,math.tau)
+        self.breath_speed = random.uniform(0.9,1.3)
+        self.blink_t      = random.uniform(0,4.0)
+        self.blink_interval = random.uniform(2.5,5.5)
+        self.blink_phase  = 0.0
+        self.eye_open     = 1.0
+        self.walk_t       = 0.0
+        self.walking      = False
+        self.twitch_t     = 0.0
+        self.twitching    = False
+        self.aura_t       = random.uniform(0,math.tau)
+
+    def update(self, dt:float, suspicion:int):
+        self.breath_t += dt * self.breath_speed
+        self.aura_t   += dt * 0.8
+        self.blink_t  += dt
+        if self.blink_t >= self.blink_interval:
+            self.blink_phase = 0.18; self.blink_t=0.0
+            self.blink_interval = random.uniform(2.5,5.5)
+        if self.blink_phase > 0:
+            self.blink_phase -= dt
+            if self.blink_phase <= 0: self.blink_phase=0; self.eye_open=1.0
+            else:
+                prog=1.0-(self.blink_phase/0.18)
+                self.eye_open=abs(math.sin(prog*math.pi))
+        if suspicion>70 and random.random()<0.008:
+            self.twitching=True; self.twitch_t=0.0
+        if self.twitching:
+            self.twitch_t+=dt
+            if self.twitch_t>0.45: self.twitching=False
+        if self.walking: self.walk_t+=dt*8.0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NPC PRESETS
+# ═══════════════════════════════════════════════════════════════════════
+
+NPC_SPRITES = [
+    {"name":"Priya Menon",   "skin":(212,132,90), "hair":(26,10,0),
+     "outfit":(83,74,183),   "acc":"glasses","role":"student","expr":"neutral",
+     "studs":[{"slot":"ear_l","color":C["gold"]}]},
+    {"name":"Dex Calloway",  "skin":(245,197,147),"hair":(200,132,58),
+     "outfit":(186,117,23),  "acc":"beanie", "role":"student","expr":"tired",
+     "studs":[]},
+    {"name":"Sable Osei",    "skin":(107,51,24),  "hair":(26,10,0),
+     "outfit":(13,13,13),    "acc":"none",  "role":"imposter","expr":"smirk",
+     "studs":[{"slot":"nose","color":(40,40,50)},{"slot":"brow_l","color":(40,40,50)}]},
+    {"name":"Tomás Reyes",   "skin":(232,168,112),"hair":(59,31,10),
+     "outfit":(29,158,117),  "acc":"glasses","role":"student","expr":"suspicious",
+     "studs":[{"slot":"ear_r","color":C["silver"]}]},
+    {"name":"Zuri Nakamura", "skin":(245,197,147),"hair":(153,51,204),
+     "outfit":(26,26,46),    "acc":"earring","role":"imposter","expr":"neutral",
+     "studs":[{"slot":"ear_l","color":C["rose"]},{"slot":"septum","color":C["rose"]},
+              {"slot":"lip",  "color":C["rose"]}]},
+]
+
+_ANIM_STATES: Dict[str,AnimState] = {}
+def get_anim(name:str) -> AnimState:
+    if name not in _ANIM_STATES: _ANIM_STATES[name]=AnimState()
+    return _ANIM_STATES[name]
+def update_all_anims(dt:float, state):
+    for p in state.players: get_anim(p.name).update(dt,p.suspicion)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SPRITE FACTORY  — with stud rendering
+# ═══════════════════════════════════════════════════════════════════════
+
+def _dk(c,f): return tuple(max(0,int(v*(1-f))) for v in c)
+def _lt(c,f): return tuple(min(255,int(v+(255-v)*f)) for v in c)
+def _acc_color(name):
+    return {"Priya Menon":(83,74,183),"Dex Calloway":(186,117,23),
+            "Sable Osei":(139,0,0),"Tomás Reyes":(29,158,117),
+            "Zuri Nakamura":(212,83,126)}.get(name,(120,112,230))
+
+class SpriteFactory:
+
+    @staticmethod
+    def draw_character(surf, cfg:dict, x:int, y:int, height:int=90,
+                       highlight:bool=False, dead:bool=False,
+                       bob_offset:float=0.0, anim:Optional[AnimState]=None,
+                       show_aura:bool=False, sus:int=0):
+        sc=height/120.0
+        def s(v): return max(1,int(v*sc))
+        skin=cfg.get("skin",(220,180,140)); hair=cfg.get("hair",(60,30,10))
+        outfit=cfg.get("outfit",(80,80,180)); acc=cfg.get("acc","none")
+        expr=cfg.get("expr","neutral"); name=cfg.get("name","")
+        studs=cfg.get("studs",[])
+        if dead:
+            gv=lambda c:(int(c[0]*.3+c[1]*.59+c[2]*.11),)*3
+            skin,hair,outfit=gv(skin),gv(hair),gv(outfit)
+        breath_dy=0; twitch_dx=0; leg_phase=0
+        if anim:
+            breath_dy=math.sin(anim.breath_t)*1.2*sc
+            if anim.twitching: twitch_dx=math.sin(anim.twitch_t*28)*2.2*sc
+            if anim.walking:   leg_phase=anim.walk_t
+        bx=int(x+twitch_dx); by=int(y+bob_offset+breath_dy)
+
+        # Aura
+        if show_aura and sus>0:
+            ar=s(42); pulse=abs(math.sin(anim.aura_t if anim else 0)) if anim else 0
+            aa=int(30+pulse*40) if sus<50 else int(60+pulse*80)
+            ac2=(C["warn"] if sus<70 else C["red"])
+            try:
+                as_=pygame.Surface((ar*2+4,ar*2+4),pygame.SRCALPHA)
+                r2,g2,b2=ac2; pygame.draw.circle(as_,(r2,g2,b2,aa),(ar+2,ar+2),ar)
+                surf.blit(as_,(bx+s(40)-ar-2,by+s(40)-ar-2))
+            except Exception: pass
+
+        # Shadow
+        pygame.draw.ellipse(surf,(0,0,0),(bx+s(12),by+s(110),s(56),s(9)))
+
+        # Legs
+        ll=s(8) if int(leg_phase)%2==0 else 0; lr=0 if int(leg_phase)%2==0 else s(8)
+        lc=_dk(outfit,0.35)
+        pygame.draw.rect(surf,lc,(bx+s(22),by+s(114)+ll,s(14),s(24)),
+                         border_bottom_left_radius=s(3),border_bottom_right_radius=s(3))
+        pygame.draw.rect(surf,lc,(bx+s(44),by+s(114)+lr,s(14),s(24)),
+                         border_bottom_left_radius=s(3),border_bottom_right_radius=s(3))
+        pygame.draw.ellipse(surf,(30,30,30),(bx+s(18),by+s(134)+ll,s(20),s(8)))
+        pygame.draw.ellipse(surf,(30,30,30),(bx+s(40),by+s(134)+lr,s(20),s(8)))
+
+        # Body
+        pygame.draw.rect(surf,outfit,(bx+s(18),by+s(62),s(44),s(54)),border_radius=s(4))
+        for bi in range(3):
+            pygame.draw.circle(surf,_dk(outfit,0.3),(bx+s(40),by+s(70)+bi*s(10)),s(2))
+        pygame.draw.polygon(surf,_lt(outfit,0.25),
+                            [(bx+s(35),by+s(62)),(bx+s(40),by+s(72)),(bx+s(45),by+s(62))])
+        tie_c=_acc_color(name)
+        pygame.draw.polygon(surf,tie_c,
+                            [(bx+s(38),by+s(66)),(bx+s(40),by+s(82)),(bx+s(42),by+s(66))])
+        pygame.draw.line(surf,_dk(outfit,0.1),(bx+s(18),by+s(66)),(bx+s(7),by+s(88)),s(5))
+        pygame.draw.circle(surf,skin,(bx+s(7),by+s(90)),s(4))
+        pygame.draw.line(surf,_dk(outfit,0.1),(bx+s(62),by+s(66)),(bx+s(73),by+s(88)),s(5))
+        pygame.draw.circle(surf,skin,(bx+s(73),by+s(90)),s(4))
+
+        # Neck + Head
+        pygame.draw.rect(surf,skin,(bx+s(35),by+s(55),s(10),s(10)))
+        pygame.draw.ellipse(surf,skin,(bx+s(20),by+s(20),s(40),s(40)))
+        pygame.draw.ellipse(surf,skin,(bx+s(17),by+s(32),s(6),s(8)))
+        pygame.draw.ellipse(surf,skin,(bx+s(57),by+s(32),s(6),s(8)))
+
+        # Hair
+        SpriteFactory._draw_hair(surf,name,hair,bx,by,s,
+                                 cfg.get("hair_style","medium") if name=="" else None)
+
+        # Eyes
+        eye_open=anim.eye_open if anim else 1.0
+        SpriteFactory._draw_eyes(surf,expr,bx,by,s,skin,eye_open)
+
+        # Mouth
+        SpriteFactory._draw_mouth(surf,expr,bx,by,s,skin)
+
+        # Accessory
+        SpriteFactory._draw_accessory(surf,acc,tie_c,bx,by,s)
+
+        # ── STUDS ────────────────────────────────────────────────────
+        SpriteFactory.draw_studs(surf,studs,bx,by,s)
+
+        if highlight:
+            pygame.draw.ellipse(surf,C["accent"],(bx+s(16),by+s(18),s(48),s(48)),s(2))
+        if dead:
+            pygame.draw.line(surf,C["red"],(bx+s(20),by+s(20)),(bx+s(60),by+s(60)),s(3))
+            pygame.draw.line(surf,C["red"],(bx+s(60),by+s(20)),(bx+s(20),by+s(60)),s(3))
+
+    @staticmethod
+    def draw_studs(surf, studs:list, bx:int, by:int, s):
+        """
+        Render each stud at its anatomically correct position.
+        Positions are expressed in the same (bx,by,s) coordinate system.
+        """
+        stud_positions = {
+            "ear_l":  (bx+s(18), by+s(38)),   # left ear lobe
+            "ear_r":  (bx+s(62), by+s(38)),   # right ear lobe
+            "nose":   (bx+s(45), by+s(44)),   # right nostril
+            "lip":    (bx+s(36), by+s(51)),   # lower lip left
+            "brow_l": (bx+s(28), by+s(27)),   # left brow
+            "septum": (bx+s(40), by+s(46)),   # septum centre
+        }
+        for stud in studs:
+            pos = stud_positions.get(stud.get("slot"))
+            if not pos: continue
+            col = stud.get("color", C["gold"])
+            r   = max(2, s(3))
+            # Stud ball
+            pygame.draw.circle(surf, col, pos, r)
+            # Highlight
+            pygame.draw.circle(surf, _lt(col,0.5), (pos[0]-1,pos[1]-1), max(1,r//2))
+            # Thin ring
+            pygame.draw.circle(surf, _dk(col,0.25), pos, r, 1)
+
+    @staticmethod
+    def _draw_hair(surf, name, hair, bx, by, s, override_style=None):
+        styles_map = {
+            "Priya Menon":"braids","Dex Calloway":"medium",
+            "Sable Osei":"bun","Tomás Reyes":"short","Zuri Nakamura":"curly"
+        }
+        style = override_style or styles_map.get(name,"medium")
+        def ep(r): pygame.draw.ellipse(surf,hair,r)
+        def rp(r,**kw): pygame.draw.rect(surf,hair,r,**kw)
+        if style=="braids":
+            ep((bx+s(20),by+s(16),s(40),s(26)))
+            rp(pygame.Rect(bx+s(14),by+s(26),s(7),s(52)),border_radius=s(3))
+            rp(pygame.Rect(bx+s(59),by+s(26),s(7),s(52)),border_radius=s(3))
+            for bi in range(4):
+                by2=by+s(36)+bi*s(12)
+                pygame.draw.line(surf,_dk(hair,0.25),(bx+s(14),by2),(bx+s(21),by2+s(6)),1)
+                pygame.draw.line(surf,_dk(hair,0.25),(bx+s(59),by2),(bx+s(66),by2+s(6)),1)
+        elif style=="bun":
+            ep((bx+s(20),by+s(18),s(40),s(24)))
+            pygame.draw.circle(surf,hair,(bx+s(40),by+s(16)),s(11))
+            pygame.draw.circle(surf,_dk(hair,0.15),(bx+s(40),by+s(16)),s(11),1)
+        elif style=="short":
+            ep((bx+s(20),by+s(18),s(40),s(22)))
+        elif style=="curly":
+            ep((bx+s(18),by+s(18),s(44),s(24)))
+            for cx in [bx+s(22),bx+s(31),bx+s(40),bx+s(49),bx+s(56)]:
+                pygame.draw.circle(surf,hair,(cx,by+s(19)),s(7))
+        elif style=="long":
+            ep((bx+s(20),by+s(18),s(40),s(28)))
+            ep((bx+s(14),by+s(24),s(12),s(60)))
+            ep((bx+s(54),by+s(24),s(12),s(60)))
+        elif style=="buzz":
+            ep((bx+s(20),by+s(18),s(40),s(18)))
+        elif style=="mohawk":
+            ep((bx+s(28),by+s(22),s(24),s(20)))
+            pygame.draw.rect(surf,hair,(bx+s(35),by+s(8),s(10),s(22)))
+        else:  # medium
+            ep((bx+s(20),by+s(18),s(40),s(26)))
+            ep((bx+s(16),by+s(24),s(10),s(20)))
+            ep((bx+s(54),by+s(24),s(10),s(20)))
+
+    @staticmethod
+    def _draw_eyes(surf,expr,bx,by,s,skin,eye_open=1.0):
+        ry_s=max(1,int(7*eye_open))
+        pygame.draw.ellipse(surf,(248,248,248),(bx+s(26),by+s(32),s(10),ry_s))
+        pygame.draw.ellipse(surf,(248,248,248),(bx+s(44),by+s(32),s(10),ry_s))
+        if eye_open>0.2:
+            iris=(70,40,15); ir=max(1,int(5*eye_open)); pr=max(1,int(3*eye_open))
+            pygame.draw.circle(surf,iris,(bx+s(31),by+s(35)),ir)
+            pygame.draw.circle(surf,iris,(bx+s(49),by+s(35)),ir)
+            pygame.draw.circle(surf,(10,10,10),(bx+s(31),by+s(35)),pr)
+            pygame.draw.circle(surf,(10,10,10),(bx+s(49),by+s(35)),pr)
+            pygame.draw.circle(surf,(255,255,255),(bx+s(32),by+s(34)),max(1,s(1)))
+            pygame.draw.circle(surf,(255,255,255),(bx+s(50),by+s(34)),max(1,s(1)))
+        if eye_open<1.0:
+            lh=max(0,int((1-eye_open)*ry_s*2))
+            pygame.draw.rect(surf,skin,(bx+s(26),by+s(32),s(10),lh))
+            pygame.draw.rect(surf,skin,(bx+s(44),by+s(32),s(10),lh))
+        bc=(40,20,5)
+        if expr=="tired":
+            pygame.draw.line(surf,bc,(bx+s(26),by+s(29)),(bx+s(36),by+s(29)),s(2))
+            pygame.draw.line(surf,bc,(bx+s(44),by+s(29)),(bx+s(54),by+s(29)),s(2))
+        elif expr=="suspicious":
+            pygame.draw.line(surf,bc,(bx+s(26),by+s(28)),(bx+s(36),by+s(30)),s(2))
+            pygame.draw.line(surf,bc,(bx+s(44),by+s(30)),(bx+s(54),by+s(28)),s(2))
+        elif expr=="smirk":
+            pygame.draw.line(surf,bc,(bx+s(26),by+s(30)),(bx+s(36),by+s(28)),s(2))
+            pygame.draw.line(surf,bc,(bx+s(44),by+s(28)),(bx+s(54),by+s(28)),s(2))
+        elif expr=="happy":
+            pygame.draw.arc(surf,bc,(bx+s(26),by+s(26),s(10),s(6)),0,math.pi,s(2))
+            pygame.draw.arc(surf,bc,(bx+s(44),by+s(26),s(10),s(6)),0,math.pi,s(2))
+        else:
+            pygame.draw.line(surf,bc,(bx+s(26),by+s(29)),(bx+s(36),by+s(28)),s(2))
+            pygame.draw.line(surf,bc,(bx+s(44),by+s(28)),(bx+s(54),by+s(29)),s(2))
+
+    @staticmethod
+    def _draw_mouth(surf,expr,bx,by,s,skin):
+        mc=_dk(skin,0.42); cx,my=bx+s(40),by+s(48)
+        if expr=="happy":
+            pygame.draw.arc(surf,mc,(cx-s(8),my-s(5),s(16),s(9)),math.pi,0,s(2))
+        elif expr=="smirk":
+            pygame.draw.arc(surf,mc,(cx-s(2),my-s(4),s(10),s(7)),math.pi,0,s(2))
+            pygame.draw.line(surf,mc,(cx-s(6),my),(cx-s(2),my),s(2))
+        elif expr=="suspicious":
+            pygame.draw.line(surf,mc,(cx-s(6),my+s(1)),(cx+s(6),my-s(1)),s(2))
+        elif expr=="tired":
+            pygame.draw.arc(surf,mc,(cx-s(7),my-s(2),s(14),s(6)),0,math.pi,s(2))
+        else:
+            pygame.draw.line(surf,mc,(cx-s(6),my),(cx+s(6),my),s(2))
+
+    @staticmethod
+    def _draw_accessory(surf,acc,color,bx,by,s):
+        if acc=="glasses":
+            pygame.draw.ellipse(surf,color,(bx+s(24),by+s(31),s(12),s(9)),s(1))
+            pygame.draw.ellipse(surf,color,(bx+s(44),by+s(31),s(12),s(9)),s(1))
+            pygame.draw.line(surf,color,(bx+s(36),by+s(35)),(bx+s(44),by+s(35)),s(1))
+            pygame.draw.line(surf,color,(bx+s(18),by+s(35)),(bx+s(24),by+s(35)),s(1))
+            pygame.draw.line(surf,color,(bx+s(56),by+s(35)),(bx+s(62),by+s(35)),s(1))
+        elif acc=="beanie":
+            pygame.draw.ellipse(surf,color,(bx+s(18),by+s(14),s(44),s(28)))
+            pygame.draw.rect(surf,_dk(color,0.15),(bx+s(18),by+s(29),s(44),s(6)))
+            pygame.draw.circle(surf,_lt(color,0.2),(bx+s(40),by+s(12)),s(5))
+        elif acc=="earring":
+            pygame.draw.circle(surf,color,(bx+s(17),by+s(40)),s(3),s(1))
+            pygame.draw.circle(surf,color,(bx+s(63),by+s(40)),s(3),s(1))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PARTICLE SYSTEM
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Particle:
+    x:float; y:float; vx:float; vy:float
+    life:float; color:Tuple[int,int,int]; size:float; kind:str="spark"
+
+class ParticleSystem:
+    MAX=320
+    def __init__(self): self.particles:List[Particle]=[]
+    def spawn_click(self,x,y,color=None):
+        color=color or C["accent"]
+        for _ in range(10):
+            a=random.uniform(0,math.tau); sp=random.uniform(1,5)
+            self.particles.append(Particle(x,y,math.cos(a)*sp,math.sin(a)*sp,
+                                           1.0,color,random.uniform(2,5),"spark"))
+    def spawn_task_complete(self,x,y):
+        for _ in range(24):
+            a=random.uniform(0,math.tau); sp=random.uniform(2,7)
+            c=random.choice([C["accent3"],C["yellow"],C["white"],C["lime"]])
+            self.particles.append(Particle(x,y,math.cos(a)*sp,math.sin(a)*sp-2,
+                                           1.0,c,random.uniform(3,7),"spark"))
+    def spawn_task_fail(self,x,y):
+        for _ in range(14):
+            a=random.uniform(0,math.tau); sp=random.uniform(1,4)
+            self.particles.append(Particle(x,y,math.cos(a)*sp,math.sin(a)*sp,
+                                           1.0,C["red"],random.uniform(3,6),"spark"))
+    def spawn_heartbeat(self,x,y):
+        for _ in range(8):
+            a=random.uniform(0,math.tau); sp=random.uniform(0.5,2)
+            self.particles.append(Particle(x,y,math.cos(a)*sp,math.sin(a)*sp-1,
+                                           1.0,C["red"],random.uniform(4,9),"pulse"))
+    def spawn_eject(self,x,y,good:bool):
+        c=C["accent3"] if good else C["red"]
+        for _ in range(28):
+            a=random.uniform(0,math.tau); sp=random.uniform(2,9)
+            self.particles.append(Particle(x,y,math.cos(a)*sp,math.sin(a)*sp-3,
+                                           1.0,c,random.uniform(3,8),"spark"))
+    def spawn_suspicion_pulse(self,x,y):
+        for r in range(4):
+            self.particles.append(Particle(x,y,0,0,1.0,C["warn"],5+r*8,"pulse"))
+    def spawn_float(self,x,y,color):
+        self.particles.append(Particle(x,y,random.uniform(-.3,.3),
+                                       random.uniform(-1.1,-.2),1.0,color,
+                                       random.uniform(3,9),"float"))
+    def spawn_trail(self,x,y,color):
+        self.particles.append(Particle(x,y,random.uniform(-.5,.5),
+                                       random.uniform(-.5,.5),.6,color,
+                                       random.uniform(2,4),"float"))
+    def update(self):
+        decay={"spark":.032,"pulse":.025,"float":.007}
+        alive=[]
+        for p in self.particles:
+            p.life-=decay.get(p.kind,.03)
+            if p.life<=0: continue
+            p.x+=p.vx; p.y+=p.vy
+            if p.kind=="spark": p.vy+=0.17; p.vx*=0.95
+            elif p.kind=="pulse": p.size+=2.2
+            alive.append(p)
+        self.particles=alive[-self.MAX:]
+    def draw(self,surf):
+        for p in self.particles:
+            alpha=int(p.life*210); r2,g2,b2=p.color
+            try:
+                sz=max(2,int(p.size))
+                s=pygame.Surface((sz*2+2,sz*2+2),pygame.SRCALPHA)
+                if p.kind=="pulse":
+                    pygame.draw.circle(s,(r2,g2,b2,alpha),(sz+1,sz+1),sz,2)
+                else:
+                    pygame.draw.circle(s,(r2,g2,b2,alpha),(sz+1,sz+1),sz)
+                surf.blit(s,(int(p.x-sz),int(p.y-sz)))
+            except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MINI-TASK SYSTEM  (same 5 tasks from v3, wired to new sounds)
+# ═══════════════════════════════════════════════════════════════════════
+
+class MiniTaskBase(ABC):
+    TIMER_MAX: float = 30.0
+    clue_bonus: int = 3
+    title: str = "TASK"
+    description: str = ""
+
+    def __init__(self):
+        self._timer=self.TIMER_MAX; self._done=False; self._failed=False
+        self._result_t=0.0
+
+    @property
+    def is_complete(self): return self._done
+    @property
+    def is_failed(self):   return self._failed
+    @property
+    def should_close(self): return (self._done or self._failed) and self._result_t<=0
+
+    def _finish(self,success:bool):
+        if self._done or self._failed: return
+        if success: self._done=True
+        else:       self._failed=True
+        self._result_t=2.2
+
+    def _base_update(self,dt):
+        if not(self._done or self._failed):
+            self._timer-=dt
+            if self._timer<=0: self._finish(False)
+        else:
+            self._result_t-=dt
+
+    def _draw_header(self,surf,title,description):
+        pygame.draw.rect(surf,C["surface2"],(0,0,W,88))
+        pygame.draw.line(surf,C["border"],(0,88),(W,88),1)
+        _draw_text(surf,title,(W//2,10),"head",C["accent"],"center")
+        _draw_text(surf,description,(W//2,40),"small",C["text2"],"center")
+        pct=max(0,self._timer/self.TIMER_MAX)
+        bc=(C["accent3"] if pct>.5 else C["warn"] if pct>.25 else C["red"])
+        bw=int((W-80)*pct)
+        pygame.draw.rect(surf,C["border"],(40,70,W-80,10),border_radius=5)
+        if bw>0: pygame.draw.rect(surf,bc,(40,70,bw,10),border_radius=5)
+        _draw_text(surf,f"{self._timer:.1f}s",(W-44,66),"tiny",bc,"right")
+
+    def _draw_result_banner(self,surf):
+        if not(self._done or self._failed): return
+        col=C["accent3"] if self._done else C["red"]
+        msg="TASK COMPLETE  +clues!" if self._done else "TIME'S UP — task failed"
+        try:
+            s=pygame.Surface((520,68),pygame.SRCALPHA)
+            r,g,b=col; pygame.draw.rect(s,(r,g,b,215),(0,0,520,68),border_radius=12)
+            surf.blit(s,(W//2-260,H//2-34))
+        except Exception: pass
+        _draw_text(surf,msg,(W//2,H//2-14),"head",C["white"],"center")
+
+    @abstractmethod
+    def handle_event(self,event,sound,particles): ...
+    @abstractmethod
+    def update(self,dt): ...
+    @abstractmethod
+    def draw(self,surf): ...
+
+
+class FixLightsTask(MiniTaskBase):
+    TIMER_MAX=28.0; clue_bonus=4
+    title="FIX THE LIGHTS"; description="Click flickering bulbs in the correct sequence. Avoid the imposter's trap."
+    def __init__(self):
+        super().__init__()
+        self._bulbs=[{"id":i,"x":130+i*160,"y":200,"state":"flicker",
+                      "ft":random.uniform(0,math.tau),"r":30} for i in range(6)]
+        ids=random.sample(range(6),4); self._sequence=ids[:3]; trap=ids[3]
+        self._bulbs[trap]["state"]="trap"
+        self._next=0; self._msg=""; self._mt=0.0
+    def handle_event(self,event,sound,particles):
+        if self._done or self._failed: return
+        if event.type!=pygame.MOUSEBUTTONDOWN or event.button!=1: return
+        mx,my=event.pos
+        for b in self._bulbs:
+            if math.hypot(mx-b["x"],my-b["y"])>b["r"]+6: continue
+            if b["state"]=="trap":
+                sound.play("task_fail"); particles.spawn_task_fail(b["x"],b["y"])
+                b["state"]="wrong"; self._msg="Trap! Imposter planted it."
+                self._mt=2.5; self._finish(False)
+            elif b["id"]==self._sequence[self._next]:
+                sound.play("light_click"); particles.spawn_click(b["x"],b["y"],C["yellow"])
+                b["state"]="on"; self._next+=1; self._msg=f"✓ {self._next}/{len(self._sequence)}"; self._mt=1.2
+                if self._next>=len(self._sequence):
+                    sound.play("task_ping"); particles.spawn_task_complete(W//2,H//2); self._finish(True)
+            else:
+                sound.play("task_fail",0.4); b["state"]="wrong"
+                self._msg="Wrong order! Reset."; self._mt=1.6
+                for b2 in self._bulbs:
+                    if b2["state"] in("on","wrong"):
+                        b2["state"]="flicker" if b2["id"]!=self._bulbs[[b3["id"] for b3 in self._bulbs if b3["state"]=="trap"][0] if any(b3["state"]=="trap" for b3 in self._bulbs) else -1].get("id",-1) else "trap"
+                self._next=0
+    def update(self,dt):
+        self._base_update(dt); self._mt=max(0,self._mt-dt)
+        for b in self._bulbs: b["ft"]+=dt*random.uniform(4,9)
+    def draw(self,surf):
+        surf.fill(C["bg"]); self._draw_header(surf,self.title,self.description)
+        pygame.draw.rect(surf,C["surface2"],(0,140,W,130))
+        for b in self._bulbs:
+            bx,by,r=b["x"],b["y"],b["r"]
+            pygame.draw.line(surf,C["border"],(bx,140),(bx,by-r-4),2)
+            pygame.draw.rect(surf,C["surface"],(bx-14,by-r-16,28,16),border_radius=4)
+            if b["state"]=="on": bc=C["yellow"]
+            elif b["state"] in("trap","wrong"): bc=C["red"]
+            else:
+                t2=abs(math.sin(b["ft"]*2.2)); bc=tuple(int(a*(1-t2)+b2*t2) for a,b2 in zip((200,200,40),(60,60,30)))
+            try:
+                gs=pygame.Surface((r*4,r*4),pygame.SRCALPHA)
+                rr,gg,bb=bc if isinstance(bc,tuple) else C["yellow"]
+                pygame.draw.circle(gs,(rr,gg,bb,45 if b["state"]=="flicker" else 75),(r*2,r*2),r*2)
+                surf.blit(gs,(bx-r*2,by-r*2))
+            except Exception: pass
+            pygame.draw.circle(surf,bc if isinstance(bc,tuple) else C["yellow"],(bx,by),r)
+            if b["id"]==self._sequence[self._next] if self._next<len(self._sequence) else False:
+                _draw_text(surf,"?",(bx,by-8),"head",C["white"],"center")
+            _draw_text(surf,f"B{b['id']+1}",(bx,by+r+8),"tiny",C["text3"],"center")
+        if self._mt>0: _draw_text(surf,self._msg,(W//2,H-110),"head",C["accent3"],"center")
+        _draw_text(surf,f"Sequence: {self._next}/{len(self._sequence)}",(W//2,H-70),"body",C["accent"],"center")
+        self._draw_result_banner(surf)
+
+
+class CleanBoardTask(MiniTaskBase):
+    TIMER_MAX=25.0; clue_bonus=3
+    title="CLEAN THE BOARD"; description="Erase green marks. Avoid the red imposter marks."
+    BOARD=pygame.Rect(80,100,W-160,400); ER=28
+    def __init__(self):
+        super().__init__()
+        self._marks=[]
+        br=self.BOARD
+        for _ in range(14):
+            self._marks.append({"x":random.randint(br.x+30,br.right-30),
+                                 "y":random.randint(br.y+30,br.bottom-30),
+                                 "r":random.randint(14,28),"kind":"evidence","erased":False,"alpha":255})
+        for _ in range(5):
+            self._marks.append({"x":random.randint(br.x+30,br.right-30),
+                                 "y":random.randint(br.y+30,br.bottom-30),
+                                 "r":random.randint(10,22),"kind":"trap","erased":False,"alpha":255})
+        random.shuffle(self._marks)
+        self._ex=W//2; self._ey=H//2; self._drag=False; self._msg=""; self._mt=0.0
+    def handle_event(self,event,sound,particles):
+        if self._done or self._failed: return
+        if event.type==pygame.MOUSEBUTTONDOWN and event.button==1: self._drag=True
+        elif event.type==pygame.MOUSEBUTTONUP and event.button==1: self._drag=False
+        elif event.type==pygame.MOUSEMOTION: self._ex,self._ey=event.pos
+    def update(self,dt):
+        self._base_update(dt); self._mt=max(0,self._mt-dt)
+        if not(self._done or self._failed) and self._drag:
+            for m in self._marks:
+                if m["erased"]: continue
+                if math.hypot(self._ex-m["x"],self._ey-m["y"])<self.ER+m["r"]:
+                    if m["kind"]=="evidence":
+                        m["alpha"]=max(0,m["alpha"]-8)
+                        if m["alpha"]==0: m["erased"]=True
+                    else:
+                        m["erased"]=True; self._msg="Erased imposter mark. Task failed."
+                        self._mt=2.5; self._finish(False); return
+            if all(m["erased"] for m in self._marks if m["kind"]=="evidence"):
+                self._finish(True)
+    def draw(self,surf):
+        surf.fill(C["bg"]); self._draw_header(surf,self.title,self.description)
+        br=self.BOARD
+        pygame.draw.rect(surf,(18,38,28),br,border_radius=8)
+        pygame.draw.rect(surf,(30,80,50),br,2,border_radius=8)
+        pygame.draw.rect(surf,(60,40,20),br.inflate(14,14),3,border_radius=10)
+        for m in self._marks:
+            if m["erased"]: continue
+            col=(80,220,100) if m["kind"]=="evidence" else (220,60,60)
+            try:
+                ms=pygame.Surface((m["r"]*2+4,m["r"]*2+4),pygame.SRCALPHA)
+                r2,g2,b2=col
+                pygame.draw.circle(ms,(r2,g2,b2,m["alpha"]),(m["r"]+2,m["r"]+2),m["r"])
+                surf.blit(ms,(m["x"]-m["r"]-2,m["y"]-m["r"]-2))
+            except Exception: pass
+        if br.collidepoint(self._ex,self._ey):
+            pygame.draw.rect(surf,(220,210,180),(self._ex-24,self._ey-14,48,28),border_radius=5)
+            pygame.draw.rect(surf,(180,160,130),(self._ex-24,self._ey-14,48,28),2,border_radius=5)
+        ev=sum(1 for m in self._marks if not m["erased"] and m["kind"]=="evidence")
+        _draw_text(surf,f"Evidence left: {ev}",(120,br.bottom+18),"body",C["accent3"])
+        if self._mt>0: _draw_text(surf,self._msg,(W//2,H-52),"head",C["red"],"center")
+        _draw_text(surf,"Hold mouse and drag eraser over green marks",(W//2,H-24),"small",C["text2"],"center")
+        self._draw_result_banner(surf)
+
+
+class WireTask(MiniTaskBase):
+    TIMER_MAX=30.0; clue_bonus=5
+    title="RECONNECT THE WIRES"; description="Match colour pairs. One wire is sabotaged — don't connect it."
+    WIRE_COLS=[(C["red"][0],C["red"][1],C["red"][2]),(116,218,74),(100,160,255),
+               (238,206,56),(218,76,158),(36,196,196)]
+    def __init__(self):
+        super().__init__()
+        n=5; cols=random.sample(self.WIRE_COLS,n)
+        lys=[160+i*90 for i in range(n)]; rys=lys[:]; random.shuffle(rys)
+        self._left=[{"id":i,"col":cols[i],"x":190,"y":lys[i],"connected":False} for i in range(n)]
+        self._right=[{"id":i,"col":cols[i],"x":W-190,"y":rys[i],"connected":False} for i in range(n)]
+        self._connections={}; self._cut=random.randint(0,n-1)
+        self._sel=None; self._mp=(0,0); self._msg=""; self._mt=0.0
+    def handle_event(self,event,sound,particles):
+        if self._done or self._failed: return
+        if event.type==pygame.MOUSEMOTION: self._mp=event.pos
+        if event.type!=pygame.MOUSEBUTTONDOWN or event.button!=1: return
+        mx,my=event.pos
+        for lt in self._left:
+            if lt["connected"]: continue
+            if math.hypot(mx-lt["x"],my-lt["y"])<22:
+                self._sel=lt; sound.play("click_soft",0.3); return
+        if self._sel:
+            for rt in self._right:
+                if rt["connected"]: continue
+                if math.hypot(mx-rt["x"],my-rt["y"])<22:
+                    lt=self._sel; self._sel=None
+                    if rt["col"]==lt["col"]:
+                        if lt["id"]==self._cut:
+                            sound.play("task_fail"); particles.spawn_task_fail(rt["x"],rt["y"])
+                            self._msg="⚡ Short circuit! Sabotaged wire."; self._mt=2.5; self._finish(False)
+                        else:
+                            lt["connected"]=rt["connected"]=True; self._connections[lt["id"]]=rt["id"]
+                            sound.play("wire_connect"); particles.spawn_click(rt["x"],rt["y"],rt["col"])
+                            self._msg="✓ Connected!"; self._mt=0.9
+                            if len(self._connections)==len(self._left)-1:
+                                sound.play("task_ping"); particles.spawn_task_complete(W//2,H//2); self._finish(True)
+                    else:
+                        sound.play("task_fail",0.35); self._msg="Wrong colour."; self._mt=1.0
+                    return
+    def update(self,dt): self._base_update(dt); self._mt=max(0,self._mt-dt)
+    def draw(self,surf):
+        surf.fill(C["bg"]); self._draw_header(surf,self.title,self.description)
+        pygame.draw.rect(surf,C["surface2"],(30,100,230,540),border_radius=8)
+        pygame.draw.rect(surf,C["surface2"],(W-260,100,230,540),border_radius=8)
+        _draw_text(surf,"INPUT",(145,112),"small",C["text3"],"center")
+        _draw_text(surf,"OUTPUT",(W-145,112),"small",C["text3"],"center")
+        for lt in self._left:
+            if lt["id"] not in self._connections: continue
+            rt=next(r for r in self._right if r["id"]==self._connections[lt["id"]])
+            pygame.draw.line(surf,lt["col"],(lt["x"],lt["y"]),(rt["x"],rt["y"]),4)
+        if self._sel:
+            mx,my=self._mp; pygame.draw.line(surf,self._sel["col"],(self._sel["x"],self._sel["y"]),(mx,my),2)
+        for lt in self._left:
+            col=lt["col"] if not lt["connected"] else C["accent3"]
+            sel=self._sel and self._sel["id"]==lt["id"]
+            pygame.draw.circle(surf,col,(lt["x"],lt["y"]),18)
+            if sel: pygame.draw.circle(surf,C["white"],(lt["x"],lt["y"]),21,2)
+            pygame.draw.circle(surf,_lt(col,0.3),(lt["x"],lt["y"]),18,2)
+            _draw_text(surf,"✓" if lt["connected"] else "○",(lt["x"],lt["y"]-7),"body",C["black"],"center")
+        for rt in self._right:
+            col=rt["col"] if not rt["connected"] else C["accent3"]
+            pygame.draw.circle(surf,col,(rt["x"],rt["y"]),18)
+            pygame.draw.circle(surf,_lt(col,0.3),(rt["x"],rt["y"]),18,2)
+            _draw_text(surf,"✓" if rt["connected"] else "○",(rt["x"],rt["y"]-7),"body",C["black"],"center")
+        cl=self._left[self._cut]
+        if not cl["connected"]:
+            pygame.draw.line(surf,C["red"],(cl["x"]+22,cl["y"]-4),(cl["x"]+52,cl["y"]+4),2)
+            _draw_text(surf,"⚠ CUT",(cl["x"]+62,cl["y"]-8),"tiny",C["red"])
+        if self._mt>0:
+            col=C["accent3"] if "✓" in self._msg else C["red"]
+            _draw_text(surf,self._msg,(W//2,H-60),"head",col,"center")
+        _draw_text(surf,f"Connected: {len(self._connections)}/{len(self._left)-1}",(W//2,H-28),"small",C["text2"],"center")
+        self._draw_result_banner(surf)
+
+
+class LockerTask(MiniTaskBase):
+    TIMER_MAX=35.0; clue_bonus=4
+    title="OPEN THE COMBINATION LOCK"; description="Match the dials. One shown digit is a lie — find it."
+    def __init__(self):
+        super().__init__()
+        self._true=[random.randint(0,9) for _ in range(3)]
+        self._lie_idx=random.randint(0,2)
+        self._shown=self._true[:]
+        self._shown[self._lie_idx]=(self._true[self._lie_idx]+random.randint(1,4))%10
+        self._dials=[0,0,0]; self._hov=-1; self._msg=""; self._mt=0.0
+        self._attempts=0; self._revealed=False
+    def handle_event(self,event,sound,particles):
+        if self._done or self._failed: return
+        if event.type==pygame.MOUSEMOTION:
+            mx,my=event.pos; self._hov=-1
+            for i in range(3):
+                if abs(mx-260-i*220)<65 and abs(my-360)<110: self._hov=i
+        if event.type==pygame.MOUSEBUTTONDOWN:
+            mx,my=event.pos
+            for i in range(3):
+                dx=260+i*220
+                if abs(mx-dx)<32 and abs(my-262)<26:
+                    self._dials[i]=(self._dials[i]+1)%10; sound.play("lock_click",0.5); particles.spawn_click(dx,280,C["accent"])
+                if abs(mx-dx)<32 and abs(my-448)<26:
+                    self._dials[i]=(self._dials[i]-1)%10; sound.play("lock_click",0.5); particles.spawn_click(dx,430,C["accent"])
+            if 490<mx<630 and H-92<my<H-46:
+                self._attempts+=1
+                if self._dials==self._true:
+                    sound.play("task_ping"); particles.spawn_task_complete(W//2,H//2); self._finish(True)
+                else:
+                    sound.play("task_fail",0.5)
+                    self._msg=f"Attempt {self._attempts}: Wrong."+(" Hint: one digit is a lie." if self._attempts==2 else "")
+                    self._mt=2.5
+                    if self._attempts>=2: self._revealed=True
+    def update(self,dt): self._base_update(dt); self._mt=max(0,self._mt-dt)
+    def draw(self,surf):
+        surf.fill(C["bg"]); self._draw_header(surf,self.title,self.description)
+        pygame.draw.rect(surf,(28,32,42),(180,110,W-360,520),border_radius=12)
+        pygame.draw.rect(surf,(46,56,76),(180,110,W-360,520),2,border_radius=12)
+        _draw_text(surf,"TARGET:",(W//2,148),"head",C["text2"],"center")
+        for i in range(3):
+            dx=260+i*220; lie=(i==self._lie_idx and self._revealed)
+            tc=C["red"] if lie else C["warn"]
+            pygame.draw.rect(surf,C["surface2"],(dx-40,168,80,58),border_radius=7)
+            pygame.draw.rect(surf,tc,(dx-40,168,80,58),2,border_radius=7)
+            _draw_text(surf,str(self._shown[i]),(dx,176),"big",tc,"center")
+            if lie: _draw_text(surf,"LIE",(dx,226),"tiny",C["red"],"center")
+        _draw_text(surf,"YOUR DIALS:",(W//2,252),"small",C["text3"],"center")
+        for i in range(3):
+            dx=260+i*220; hl=(i==self._hov)
+            ac=C["accent"] if hl else C["text3"]
+            pygame.draw.polygon(surf,ac,[(dx,254),(dx-24,280),(dx+24,280)])
+            pygame.draw.rect(surf,C["surface"],(dx-54,286,108,128),border_radius=11)
+            pygame.draw.rect(surf,C["accent"] if hl else C["border"],(dx-54,286,108,128),2,border_radius=11)
+            _draw_text(surf,str(self._dials[i]),(dx,302),"big",C["white"],"center")
+            ok=(self._dials[i]==self._true[i])
+            pygame.draw.circle(surf,C["accent3"] if ok else C["text3"],(dx,400),9)
+            pygame.draw.polygon(surf,ac,[(dx,456),(dx-24,430),(dx+24,430)])
+        pygame.draw.rect(surf,C["accent"],(490,H-94,140,48),border_radius=8)
+        _draw_text(surf,"SUBMIT",(W//2,H-82),"head",C["black"],"center")
+        if self._mt>0:
+            _draw_text(surf,self._msg,(W//2,H-120),"small",
+                       C["red"] if "Wrong" in self._msg else C["accent3"],"center")
+        self._draw_result_banner(surf)
+
+
+class MatchUniformTask(MiniTaskBase):
+    TIMER_MAX=32.0; clue_bonus=3
+    title="MATCH THE UNIFORMS"; description="Drag items to the correct mannequin slot. One item is an imposter plant."
+    PIECES=[("Blazer",C["accent"],0),("Tie",C["red"],1),
+            ("Shirt",C["white"],2),("Trousers",(60,60,90),3),("Shoes",(30,30,30),3)]
+    SLOTS=["Jacket","Neck","Shirt","Lower"]; SLOT_X=[180,400,620,840]; SLOT_Y=320
+    def __init__(self):
+        super().__init__()
+        self._pieces=[{"id":i,"label":l,"color":col,"correct_slot":sl,
+                       "x":130+i*165,"y":530,"dragging":False,"placed":False,"wrong":False,"ox":0,"oy":0}
+                      for i,(l,col,sl) in enumerate(self.PIECES)]
+        xs=[130+i*165 for i in range(len(self._pieces))]; random.shuffle(xs)
+        for p,x in zip(self._pieces,xs): p["x"]=x
+        self._slots_filled=[None]*len(self.SLOTS); self._dp=None; self._msg=""; self._mt=0.0
+    def handle_event(self,event,sound,particles):
+        if self._done or self._failed: return
+        if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+            mx,my=event.pos
+            for p in self._pieces:
+                if p["placed"]: continue
+                if abs(mx-p["x"])<38 and abs(my-p["y"])<28:
+                    p["dragging"]=True; p["ox"]=mx-p["x"]; p["oy"]=my-p["y"]; self._dp=p
+                    sound.play("uniform_rustle",0.45); break
+        elif event.type==pygame.MOUSEMOTION and self._dp:
+            mx,my=event.pos; self._dp["x"]=mx-self._dp["ox"]; self._dp["y"]=my-self._dp["oy"]
+            particles.spawn_trail(mx,my,self._dp["color"])
+        elif event.type==pygame.MOUSEBUTTONUP and event.button==1:
+            p=self._dp;
+            if not p: return
+            p["dragging"]=False; self._dp=None; mx,my=p["x"],p["y"]
+            for si,(sx,sl) in enumerate(zip(self.SLOT_X,self.SLOTS)):
+                if abs(mx-sx)<58 and abs(my-self.SLOT_Y)<52:
+                    if p["correct_slot"]==si and self._slots_filled[si] is None:
+                        p["placed"]=True; p["x"]=sx; p["y"]=self.SLOT_Y-20
+                        self._slots_filled[si]=p["id"]; sound.play("uniform_snap")
+                        particles.spawn_click(sx,self.SLOT_Y,p["color"])
+                        self._msg=f"✓ {p['label']} matched!"; self._mt=1.4
+                        correct=sum(1 for pk in self._pieces if pk["placed"] and pk["id"]!=4)
+                        if correct==len(self.SLOTS): sound.play("task_ping"); particles.spawn_task_complete(W//2,H//2); self._finish(True)
+                    else:
+                        sound.play("task_fail",0.4); p["wrong"]=True; self._msg=f"✗ Wrong slot."; self._mt=1.6; particles.spawn_task_fail(mx,my)
+                    break
+    def update(self,dt): self._base_update(dt); self._mt=max(0,self._mt-dt)
+    def draw(self,surf):
+        surf.fill(C["bg"]); self._draw_header(surf,self.title,self.description)
+        for si,(sx,sl) in enumerate(zip(self.SLOT_X,self.SLOTS)):
+            filled=self._slots_filled[si] is not None; col=C["accent3"] if filled else C["border"]
+            pygame.draw.ellipse(surf,col,(sx-20,195,40,46),2)
+            pygame.draw.rect(surf,col,(sx-22,240,44,82),2)
+            pygame.draw.rect(surf,col,(sx-22,320,18,52),2); pygame.draw.rect(surf,col,(sx+4,320,18,52),2)
+            _draw_text(surf,sl,(sx,378),"tiny",col,"center")
+            sr=pygame.Rect(sx-58,self.SLOT_Y-52,116,104)
+            try:
+                s2=pygame.Surface((116,104),pygame.SRCALPHA)
+                rr,gg,bb=col; pygame.draw.rect(s2,(rr,gg,bb,28),(0,0,116,104),border_radius=8)
+                surf.blit(s2,sr.topleft)
+            except Exception: pass
+            pygame.draw.rect(surf,col,sr,1,border_radius=8)
+        pygame.draw.rect(surf,C["surface2"],(50,460,W-100,110),border_radius=6)
+        pygame.draw.rect(surf,C["border"],(50,460,W-100,110),1,border_radius=6)
+        _draw_text(surf,"CLOTHING TRAY",(W//2,468),"tiny",C["text3"],"center")
+        for p in self._pieces:
+            if p["dragging"]: continue
+            self._dp_draw(surf,p)
+        if self._dp: self._dp_draw(surf,self._dp)
+        if self._mt>0:
+            col=C["accent3"] if "✓" in self._msg else C["red"]
+            _draw_text(surf,self._msg,(W//2,H-64),"head",col,"center")
+        self._draw_result_banner(surf)
+    def _dp_draw(self,surf,p):
+        col=(C["red"] if p["wrong"] else C["accent3"] if p["placed"] else p["color"])
+        px,py=int(p["x"]),int(p["y"]); r=pygame.Rect(px-38,py-26,76,52)
+        pygame.draw.rect(surf,col,r,border_radius=6); pygame.draw.rect(surf,_lt(col,.3),r,1,border_radius=6)
+        _draw_text(surf,p["label"],(px,py-8),"small",C["black"],"center")
+
+
+TASK_CLASSES=[FixLightsTask,MatchUniformTask,CleanBoardTask,WireTask,LockerTask]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MINI-TASK SCENE
+# ═══════════════════════════════════════════════════════════════════════
+
+class MiniTaskScene:
+    def __init__(self,game):
+        self.game=game
+        idx=(game.engine.state.current_floor-1)%len(TASK_CLASSES)
+        self.task=TASK_CLASSES[idx]()
+        self._arch=SchoolArchitecture()
+        self._closing=False
+        if isinstance(self.task,FixLightsTask): game.sound.play("light_buzz",0.3)
+    def handle_event(self,event):
+        if not self._closing: self.task.handle_event(event,self.game.sound,self.game.particles)
+    def update(self,dt):
+        self._arch.update(dt,self.game.engine.state.current_floor)
+        self.task.update(dt)
+        if self.task.should_close and not self._closing:
+            self._closing=True
+            bonus=self.task.clue_bonus if self.task.is_complete else 0
+            s=self.game.engine.state
+            s.clues_total+=bonus
+            # ── FLOOR GATE: mark floor as task-complete ──────────────
+            if self.task.is_complete:
+                s.floor_task_done.add(s.current_floor)
+            self.game.after_delay(2200,self._advance)
+    def _advance(self):
+        eng=self.game.engine
+        win=eng.check_win()
+        if win is not None: self.game.switch_scene("result")
+        else: eng.advance_floor(); self.game.switch_scene("lobby")
+    def draw(self,surf):
+        self._arch.draw(surf,self.game.engine.state.current_floor,alpha_overlay=160)
+        self.task.draw(surf)
+        _draw_text(surf,f"Floor {self.game.engine.state.current_floor}  ·  Mini-Task",
+                   (W-16,8),"tiny",C["text3"],"right")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  GAME DATA & ENGINE  — with floor gate
+# ═══════════════════════════════════════════════════════════════════════
+
+class Role(Enum):
+    STUDENT="student"; IMPOSTER="imposter"
+
+class TaskResult(Enum):
+    SUCCESS="success"; SABOTAGED="sabotaged"
+
+@dataclass
+class Player:
+    name:str; role:Role; sprite_cfg:dict
+    is_human:bool=False; alive:bool=True; suspicion:int=0; tasks_done:int=0
+    def is_imposter(self): return self.role==Role.IMPOSTER
+
+@dataclass
+class Task:
+    id:str; title:str; description:str; floor:int; location:str
+    difficulty:int; clues_reward:int; tragic:bool
+    completed:bool=False; sabotaged:bool=False
+
+@dataclass
+class GameState:
+    players:         List[Player]  = field(default_factory=list)
+    current_floor:   int           = 1
+    total_floors:    int           = 10
+    clues_total:     int           = 0
+    clues_needed:    int           = 15
+    tasks_completed: int           = 0
+    tasks_sabotaged: int           = 0
+    ejected:         List[str]     = field(default_factory=list)
+    game_over:       bool          = False
+    students_win:    bool          = False
+    phase:           str           = "task"
+    current_tasks:   List[Task]    = field(default_factory=list)
+    log:             List[str]     = field(default_factory=list)
+    visited_floors:  set           = field(default_factory=set)
+    # v4 additions
+    floor_task_done: set           = field(default_factory=set)   # floors where mini-task completed
+    human_config:    dict          = field(default_factory=dict)  # persisted customization
+
+    def living_players(self):   return [p for p in self.players if p.alive]
+    def living_imposters(self): return [p for p in self.players if p.alive and p.is_imposter()]
+    def living_students(self):  return [p for p in self.players if p.alive and not p.is_imposter()]
+    def human_player(self):     return next((p for p in self.players if p.is_human),None)
+
+
+TASK_POOL=[
+    ("lib_shred","Reconstruct the shredded file","Hold your fragment in sequence.\nSomeone keeps dropping theirs.","Library",1,2,False),
+    ("caf_tray","Decode the cafeteria tray","The lunch lady is crying.\nHer schedule holds a 1994 secret.","Cafeteria",1,2,True),
+    ("bus_bay","Stop the evidence buses","A bus leaves every 90 seconds.\nVote which clues to save.","Bus Bay",2,3,False),
+    ("locker_room","Open the jammed locker","The combo is split across three players.\nOne keeps giving you the wrong number.","Hallway B",1,2,False),
+    ("chem_lab","Synthesise the memory compound","8 reagents. Describe yours verbally.\nIf it explodes, a memory is erased.","Chemistry Lab",3,4,True),
+    ("server","Recover the deleted yearbook","A year that didn't happen.\nDecrypt before someone extends it.","Server Room",3,4,False),
+    ("detention","Match the detention slips","Seven erased students.\nWrong simultaneous match corrupts data.","Detention Hall",3,4,True),
+    ("principal","Read the founding charter","Four rooms. One line each.\nWrong sequence? Room locks forever.","Principal's Office",4,5,True),
+    ("surveillance","Scrub the footage","Disappeared students. You watch in pairs.\nYour partner narrates.","Surveillance",4,5,True),
+    ("records","Find the first witness","64 folders. One imposter knows exactly which.\nThey'll offer to help. Eventually.","Records Archive",4,5,False),
+    ("loop_hall","Map the loop hallway","It repeats every 40 steps.\nAgree on when you've truly made progress.","Loop Hallway",5,6,False),
+    ("clock","Triangulate the true time","Six clocks. Five are fake.\nMissing early clues makes this impossible.","Clock Tower",5,7,True),
+    ("charter","Read the charter aloud","Everyone reads one line simultaneously.\nIf any line is wrong, room resets.","Charter Room",5,8,True),
+]
+
+def generate_tasks(floor:int)->List[Task]:
+    tier=min((floor-1)//3,3); ranges=[(0,4),(3,7),(6,10),(10,13)]
+    lo,hi=ranges[tier]; pool=TASK_POOL[lo:hi]
+    if len(pool)<3: pool=TASK_POOL[:4]
+    chosen=random.sample(pool,min(3,len(pool)))
+    return [Task(d[0],d[1],d[2],floor,d[3],d[4],d[5],d[6]) for d in chosen]
+
+
+class GameEngine:
+    def __init__(self): self.state=GameState()
+
+    def new_game(self,human_name:str,human_cfg:dict=None):
+        s=self.state
+        cfg=human_cfg or dict(DEFAULT_PLAYER_CONFIG); cfg["name"]=human_name
+        human=Player(human_name,Role.STUDENT,cfg,is_human=True)
+        npcs=[Player(p["name"],Role[p["role"].upper()],dict(p)) for p in NPC_SPRITES]
+        s.players=([human]+npcs); s.current_floor=1
+        s.clues_total=s.tasks_completed=s.tasks_sabotaged=0; s.clues_needed=15
+        s.ejected=[]; s.game_over=False; s.students_win=False; s.phase="task"
+        s.visited_floors={1}; s.floor_task_done=set()
+        s.log=["Blackwell Vertical Academy.","100 floors. No exit on the map.",
+               "Two of your classmates work for the school.",
+               "They have always worked for the school.","Good luck."]
+        s.current_tasks=generate_tasks(1)
+        for p in s.players: _ANIM_STATES.pop(p.name,None)
+
+    def can_advance_floor(self)->bool:
+        """
+        FLOOR GATE: player may only advance once the current floor's
+        mini-task has been completed (earned its clue bonus).
+        """
+        return self.state.current_floor in self.state.floor_task_done
+
+    def resolve_task(self,task:Task):
+        s=self.state; sab=min(0.25+(s.current_floor/s.total_floors)*0.30,0.55)
+        imps=s.living_imposters(); sabotaged=imps and not task.sabotaged and random.random()<sab
+        if sabotaged:
+            task.sabotaged=True; who=random.choice(imps)
+            who.suspicion=min(100,who.suspicion+random.randint(5,15)); s.tasks_sabotaged+=1
+            s.log.append(f"SABOTAGE — {task.title}")
+            return TaskResult.SABOTAGED,random.choice([f"{who.name} was 'very helpful'.",f"{who.name} looked unbothered.",f"{who.name} offered to redo it."])
+        else:
+            task.completed=True; s.clues_total+=task.clues_reward; s.tasks_completed+=1
+            h=s.human_player()
+            if h: h.tasks_done+=1
+            s.log.append(f"COMPLETE — {task.title} (+{task.clues_reward})")
+            return TaskResult.SUCCESS,random.choice([f"+{task.clues_reward} clues added.",f"Done. {task.clues_reward} clues recovered.",f"Success. {task.clues_reward} clues."])
+
+    def run_npc_votes(self):
+        s=self.state; votes={}
+        for p in s.living_players():
+            if p.is_human: continue
+            cands=[c for c in s.living_players() if c.name!=p.name]
+            if not cands: continue
+            if p.is_imposter():
+                stu=[c for c in cands if not c.is_imposter()]
+                target=min(stu,key=lambda x:x.suspicion) if stu else random.choice(cands)
+            else:
+                wts=[max(1,c.suspicion+random.randint(-20,20)) for c in cands]
+                r=random.random()*sum(wts); cum=0; target=cands[0]
+                for c,w in zip(cands,wts):
+                    cum+=w
+                    if r<=cum: target=c; break
+            votes[p.name]=target.name
+        return votes
+
+    def resolve_vote(self,all_votes):
+        s=self.state; tally={}
+        for v in all_votes.values(): tally[v]=tally.get(v,0)+1
+        if not tally: return None
+        mx=max(tally.values()); winners=[n for n,v in tally.items() if v==mx]
+        if len(winners)>1: s.log.append("VOTE — Tied."); return None
+        name=winners[0]; p=next((x for x in s.players if x.name==name),None)
+        if p: p.alive=False; s.ejected.append(name); s.log.append(f"EJECTED — {name}")
+        return name
+
+    def check_win(self):
+        s=self.state
+        if not s.living_imposters(): s.game_over=s.students_win=True; return True
+        if len(s.living_imposters())>=len(s.living_students()):
+            s.game_over=True; s.students_win=False; return False
+        if s.current_floor>=s.total_floors:
+            won=s.clues_total>=s.clues_needed; s.game_over=True; s.students_win=won; return won
+        return None
+
+    def advance_floor(self):
+        s=self.state; s.current_floor+=1
+        s.current_tasks=generate_tasks(s.current_floor); s.phase="task"
+        s.visited_floors.add(s.current_floor)
+        for p in s.living_imposters(): p.suspicion=min(100,p.suspicion+random.randint(2,8))
+        for p in s.living_students():  p.suspicion=max(0,p.suspicion+random.randint(-3,5))
+        s.log.append(f"── FLOOR {s.current_floor} ──")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  UI PRIMITIVES
+# ═══════════════════════════════════════════════════════════════════════
+
+class Button:
+    STYLES={
+        "primary":{"bg":C["accent"],  "fg":C["black"],  "hover":(140,132,245)},
+        "danger": {"bg":C["red"],     "fg":C["black"],  "hover":(240,110,110)},
+        "ghost":  {"bg":C["surface2"],"fg":C["text2"],  "hover":C["border"]},
+        "success":{"bg":C["accent3"], "fg":C["black"],  "hover":(66,182,142)},
+        "warn":   {"bg":C["warn"],    "fg":C["black"],  "hover":(202,142,50)},
+        "locked": {"bg":C["locked"],  "fg":C["text3"],  "hover":C["locked"]},
+    }
+    def __init__(self,rect,text,style="primary",font_key="body",ctx="ui"):
+        self.rect=pygame.Rect(rect); self.text=text; self.style=style
+        self.font_key=font_key; self.ctx=ctx
+        self._hovered=False; self._press_t=0.0; self.disabled=False
+    def handle_event(self,event,sound,particles)->bool:
+        if self.disabled: return False
+        if event.type==pygame.MOUSEMOTION: self._hovered=self.rect.collidepoint(event.pos)
+        if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+            if self.rect.collidepoint(event.pos):
+                self._press_t=time.time()
+                sound.play_ctx(self.ctx)
+                particles.spawn_click(*self.rect.center,
+                                      color=self.STYLES[self.style]["bg"])
+                return True
+        return False
+    def draw(self,surf):
+        st=self.STYLES.get(self.style,self.STYLES["primary"])
+        bg=st["hover"] if (self._hovered and not self.disabled) else st["bg"]
+        if self.disabled: bg=C["surface2"]
+        sh=2 if (time.time()-self._press_t)<0.1 else 0
+        r=self.rect.inflate(-sh*2,-sh*2)
+        pygame.draw.rect(surf,bg,r,border_radius=7)
+        pygame.draw.rect(surf,_lt(bg,0.13),(r.x+1,r.y+1,r.w-2,3),border_radius=7)
+        fg=C["text3"] if self.disabled else st["fg"]
+        font=FONTS.get(self.font_key,FONTS["body"])
+        txt=font.render(self.text,True,fg)
+        surf.blit(txt,txt.get_rect(center=r.center))
+        if self.disabled:
+            pygame.draw.rect(surf,C["locked"],r,2,border_radius=7)
+            lock=FONTS.get("tiny",FONTS["body"]).render("🔒",True,C["text3"])
+            surf.blit(lock,(r.right-20,r.y+4))
+
+
+def _draw_text(surf,text,pos,font_key="body",color=None,align="left",max_width=None):
+    color=color or C["text"]; font=FONTS.get(font_key,FONTS["body"])
+    if max_width:
+        words=text.split(); lines,line=[],[]
+        for w in words:
+            if font.size(" ".join(line+[w]))[0]<=max_width: line.append(w)
+            else:
+                if line: lines.append(" ".join(line))
+                line=[w]
+        if line: lines.append(" ".join(line))
+    else: lines=text.split("\n")
+    x,y=pos
+    for ln in lines:
+        s=font.render(ln,True,color)
+        rx=(x-s.get_width()//2 if align=="center" else
+            x-s.get_width()    if align=="right"  else x)
+        surf.blit(s,(rx,y)); y+=font.get_height()+2
+    return y
+
+def _draw_panel(surf,rect,color=None,border=True,radius=8,alpha=None):
+    color=color or C["surface"]
+    if alpha is not None:
+        s=pygame.Surface((rect.w,rect.h),pygame.SRCALPHA)
+        r,g,b=color; pygame.draw.rect(s,(r,g,b,alpha),(0,0,rect.w,rect.h),border_radius=radius)
+        surf.blit(s,rect.topleft)
+    else: pygame.draw.rect(surf,color,rect,border_radius=radius)
+    if border: pygame.draw.rect(surf,C["border"],rect,1,border_radius=radius)
+
+def _draw_sus_bar(surf,rect,value,color):
+    pygame.draw.rect(surf,C["surface2"],rect,border_radius=3)
+    if value>0:
+        fr=pygame.Rect(rect.x,rect.y,int(rect.w*value/100),rect.h)
+        pygame.draw.rect(surf,color,fr,border_radius=3)
+    pygame.draw.rect(surf,C["border"],rect,1,border_radius=3)
+
+def _draw_floor_gate_notice(surf, floor: int):
+    """Draw a prominent locked-floor overlay notice."""
+    notice_r = pygame.Rect(W//2-320,H//2-60,640,120)
+    _draw_panel(surf,notice_r,C["locked"],radius=12,alpha=230)
+    pygame.draw.rect(surf,C["red"],notice_r,2,border_radius=12)
+    _draw_text(surf,"🔒 FLOOR LOCKED",(W//2,H//2-48),"head",C["red"],"center")
+    _draw_text(surf,f"Complete the Floor {floor} Mini-Task first to advance.",
+               (W//2,H//2-16),"body",C["text2"],"center")
+    _draw_text(surf,'Use the "Floor Mini-Task" button in the task result screen.',
+               (W//2,H//2+14),"small",C["text3"],"center")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SCHOOL MAP
+# ═══════════════════════════════════════════════════════════════════════
+
+FLOOR_ROOMS={
+    1:[("Library",C["accent"]),("Hallway A",C["text3"]),("Cafeteria",C["accent2"])],
+    2:[("Hallway B",C["text3"]),("Bus Bay",C["warn"]),("Locker Bay",C["text3"])],
+    3:[("Gym",C["accent3"]),("Art Room",C["accent"]),("Stairwell",C["text3"])],
+    4:[("Chem Lab",C["accent2"]),("Server Rm",C["accent"]),("Detention",C["warn"])],
+    5:[("Records",C["accent"]),("Counselor",C["warn"]),("Boiler Rm",C["text3"])],
+    6:[("Principal",C["accent2"]),("Archives",C["accent"]),("Staff Rm",C["text3"])],
+    7:[("Roof Acc.",C["text3"]),("CCTV Rm",C["accent"]),("Storage",C["warn"])],
+    8:[("Attic",C["warn"]),("Loop Hall",C["accent2"]),("Sealed Rm",C["text3"])],
+    9:[("Clock Twr",C["accent"]),("Obs. Deck",C["accent2"]),("Void Stair",C["text3"])],
+    10:[("Charter Rm",C["accent2"]),("Exit???",C["accent3"]),("Endgame",C["red"])],
+}
+
+class SchoolMap:
+    FH=46
+    def draw(self,surf,current,rect,visited,tasks_done:set):
+        _draw_panel(surf,rect,C["surface"],radius=8)
+        font=FONTS.get("small",FONTS["body"])
+        surf.blit(font.render("BLACKWELL",True,C["text3"]),(rect.x+8,rect.y+6))
+        vis=8; end=min(10,current+vis//2); start=max(1,end-vis+1); end=min(10,start+vis-1)
+        for i,fl in enumerate(range(end,start-1,-1)):
+            fy=rect.y+28+i*self.FH; fx=rect.x+6; fw=rect.w-12
+            is_cur=(fl==current); is_vis=fl in visited; is_done=fl in tasks_done
+            bg=(C["surface2"] if is_cur else (C["surface"] if not is_vis else (18,20,32)))
+            bc=(C["accent"] if is_cur else C["accent3"] if is_done else C["border"])
+            fr=pygame.Rect(fx,fy,fw,self.FH-4)
+            pygame.draw.rect(surf,bg,fr,border_radius=5)
+            pygame.draw.rect(surf,bc,fr,1 if not is_cur else 2,border_radius=5)
+            fc=(C["accent"] if is_cur else C["text2"] if is_vis else C["text3"])
+            tf=FONTS.get("small",FONTS["body"])
+            surf.blit(tf.render(f"F{fl:02d}",True,fc),(fx+4,fy+(self.FH-4)//2-7))
+            # Task-done checkmark
+            if is_done:
+                surf.blit(FONTS.get("tiny",FONTS["body"]).render("✓",True,C["accent3"]),(fx+fw-18,fy+8))
+            for ri,(rn,rc) in enumerate(FLOOR_ROOMS.get(fl,[])):
+                rx=fx+36+ri*78; rr=pygame.Rect(rx,fy+5,74,self.FH-14)
+                rb=rc if is_cur else _dk(rc,0.5)
+                pygame.draw.rect(surf,rb,rr,border_radius=3)
+                surf.blit(FONTS.get("tiny",FONTS["body"]).render(rn,True,C["text"] if is_cur else C["text3"]),(rx+3,fy+(self.FH-4)//2-6))
+            if is_cur:
+                ax=rect.right-16; ay=fy+self.FH//2-6
+                pygame.draw.polygon(surf,C["accent"],[(ax,ay),(ax+10,ay+6),(ax,ay+12)])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TRANSITION
+# ═══════════════════════════════════════════════════════════════════════
+
+class Transition:
+    DUR=0.26
+    def __init__(self): self._a=0; self._on=False; self._el=0.0
+    def start(self): self._a=255; self._on=True; self._el=0.0
+    @property
+    def done(self): return not self._on
+    def update(self,dt):
+        if not self._on: return
+        self._el+=dt; self._a=max(0,int(255*(1-self._el/self.DUR)))
+        if self._a==0: self._on=False
+    def draw(self,surf):
+        if self._a<=0: return
+        ov=pygame.Surface((W,H)); ov.set_alpha(self._a); ov.fill(C["bg"]); surf.blit(ov,(0,0))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SCENES
+# ═══════════════════════════════════════════════════════════════════════
+
+class TitleScene:
+    def __init__(self,game):
+        self.game=game; self.name=""; self._cursor=True; self._ct=0.0; self._bt=0.0
+        self._arch=SchoolArchitecture()
+        self.orbs=[{"x":random.randint(50,W-50),"y":random.randint(50,H-50),
+                    "r":random.randint(60,160),"col":random.choice([C["accent"],C["accent2"],C["accent3"]]),
+                    "dx":random.uniform(-.3,.3),"dy":random.uniform(-.3,.3),"a":random.randint(10,25)}
+                   for _ in range(5)]
+        cx=W//2
+        self.btn_start=Button((cx-130,510,260,48),"ENTER BLACKWELL","primary","head","nav")
+        self.btn_customize=Button((cx-130,568,260,40),"Customize Character","ghost","body","ui")
+        self.btn_quit=Button((cx-70,618,140,34),"Quit","ghost","small","ui")
+
+    def handle_event(self,event):
+        if event.type==pygame.KEYDOWN:
+            if event.key==pygame.K_BACKSPACE: self.name=self.name[:-1]
+            elif event.key==pygame.K_RETURN: self._start()
+            elif event.unicode and len(self.name)<20: self.name+=event.unicode
+        if self.btn_start.handle_event(event,self.game.sound,self.game.particles):
+            self.game.after_delay(400,self._start)
+        if self.btn_customize.handle_event(event,self.game.sound,self.game.particles):
+            # Init a stub game state for customizer
+            name=self.name.strip() or "Student"
+            if not self.game.engine.state.players:
+                self.game.engine.new_game(name,self.game.human_config)
+            self.game.switch_scene("customize")
+        if self.btn_quit.handle_event(event,self.game.sound,self.game.particles):
+            self.game.quit()
+
+    def update(self,dt):
+        self._bt+=dt; self._ct+=dt; self._arch.update(dt,1)
+        if self._ct>0.52: self._cursor=not self._cursor; self._ct=0
+        for o in self.orbs:
+            o["x"]+=o["dx"]; o["y"]+=o["dy"]
+            if o["x"]<-o["r"] or o["x"]>W+o["r"]: o["dx"]*=-1
+            if o["y"]<-o["r"] or o["y"]>H+o["r"]: o["dy"]*=-1
+        for npc in NPC_SPRITES: get_anim(npc["name"]).update(dt,0)
+
+    def draw(self,surf):
+        # Architecture background
+        self._arch.draw(surf,1,alpha_overlay=185)
+        # Soft orbs
+        for o in self.orbs:
+            try:
+                s=pygame.Surface((o["r"]*2,o["r"]*2),pygame.SRCALPHA)
+                r2,g2,b2=o["col"]; pygame.draw.circle(s,(r2,g2,b2,o["a"]),(o["r"],o["r"]),o["r"])
+                surf.blit(s,(int(o["x"]-o["r"]),int(o["y"]-o["r"])))
+            except: pass
+
+        cx=W//2; bob=math.sin(self._bt*1.1)*4
+        _draw_text(surf,"HALL PASS",(cx,int(96+bob)),"big",C["accent"],"center")
+        _draw_text(surf,"TO HELL",  (cx,int(148+bob)),"big",C["text"],"center")
+        _draw_text(surf,"v4.0  ·  School Architecture  ·  Click Sounds  ·  Floor Gate  ·  Studs",
+                   (cx,210),"small",C["text3"],"center")
+        pygame.draw.line(surf,C["border"],(cx-280,232),(cx+280,232),1)
+
+        lore=["Blackwell Vertical Academy. 100 floors. No exit.",
+              "","Two of your classmates work for the school.",
+              "They have always worked for the school.","","Find the truth."]
+        y=244
+        for ln in lore:
+            _draw_text(surf,ln,(cx,y),"body",C["text2"] if ln else C["bg"],"center")
+            y+=26 if ln else 8
+
+        pygame.draw.line(surf,C["border"],(cx-280,y+4),(cx+280,y+4),1)
+        _draw_text(surf,"Your name:",(cx,y+18),"small",C["text3"],"center")
+        ir=pygame.Rect(cx-170,y+36,340,40)
+        pygame.draw.rect(surf,C["surface2"],ir,border_radius=6)
+        pygame.draw.rect(surf,C["accent"],ir,1,border_radius=6)
+        _draw_text(surf,self.name+("|" if self._cursor else " "),(cx,y+44),"head",C["text"],"center")
+
+        self.btn_start.draw(surf); self.btn_customize.draw(surf); self.btn_quit.draw(surf)
+
+        # NPC row at bottom
+        for i,npc in enumerate(NPC_SPRITES):
+            nx=80+i*220; bob2=math.sin(self._bt*0.8+i)*3
+            an=get_anim(npc["name"])
+            SpriteFactory.draw_character(surf,npc,nx,H-148,height=78,bob_offset=bob2,anim=an)
+            _draw_text(surf,npc["name"].split()[0],(nx+39,H-62),"tiny",C["text3"],"center")
+
+    def _start(self):
+        name=self.name.strip() or "Student"
+        cfg=dict(self.game.human_config) if self.game.human_config else None
+        self.game.engine.new_game(name,cfg)
+        self.game.switch_scene("lobby")
+
+
+class LobbyScene:
+    def __init__(self,game):
+        self.game=game; self._bt=0.0; self.school_map=SchoolMap()
+        self._arch=SchoolArchitecture(); self._hb=0.0
+        s=game.engine.state
+        label=(f"Enter Floor {s.current_floor}" if s.phase=="task" else "Cast Your Vote")
+        can_adv=game.engine.can_advance_floor() or s.current_floor==1
+        cx=W//2+40
+        self.btn_proceed=Button((cx-155,H-80,310,48),label,
+                                "primary" if can_adv else "locked","head","nav")
+        self.btn_proceed.disabled=not can_adv
+        self.btn_customize=Button((20,H-58,150,36),"Customize","ghost","small","ui")
+        self.btn_quit=Button((W-170,H-58,150,36),"Quit","ghost","small","ui")
+        self._show_gate=not can_adv
+
+    def handle_event(self,event):
+        if self.btn_proceed.handle_event(event,self.game.sound,self.game.particles):
+            if self.game.engine.can_advance_floor() or self.game.engine.state.current_floor==1:
+                self.game.after_delay(320,self._proceed)
+            else:
+                self.game.sound.play("floor_locked",0.7)
+                self._show_gate=True
+        if self.btn_customize.handle_event(event,self.game.sound,self.game.particles):
+            self.game.switch_scene("customize")
+        if self.btn_quit.handle_event(event,self.game.sound,self.game.particles):
+            self.game.quit()
+        # Dismiss gate notice on any click
+        if event.type==pygame.MOUSEBUTTONDOWN: self._show_gate=False
+
+    def _proceed(self):
+        s=self.game.engine.state
+        self.game.switch_scene("vote" if s.phase=="vote" else "floor")
+
+    def update(self,dt):
+        self._bt+=dt; self._arch.update(dt,self.game.engine.state.current_floor)
+        update_all_anims(dt,self.game.engine.state)
+        if random.random()<0.04:
+            self.game.particles.spawn_float(random.randint(400,W-50),H//2+random.randint(-80,80),C["accent"])
+        s=self.game.engine.state; self._hb-=dt
+        if self._hb<=0:
+            for p in s.living_players():
+                if p.suspicion>80:
+                    self.game.sound.play("heartbeat",0.28)
+                    self.game.particles.spawn_heartbeat(W//2+random.randint(-200,200),H//3)
+                    self._hb=1.9; break
+
+    def draw(self,surf):
+        self._arch.draw(surf,self.game.engine.state.current_floor,alpha_overlay=170)
+        s=self.game.engine.state
+
+        _draw_text(surf,f"BLACKWELL ACADEMY — FLOOR {s.current_floor}",
+                   (W//2,18),"head",C["accent"],"center")
+        _draw_text(surf,
+                   f"Clues: {s.clues_total}/{s.clues_needed}  ·  Tasks: {s.tasks_completed}  ·  Sabotages: {s.tasks_sabotaged}",
+                   (W//2,48),"small",C["text2"],"center")
+
+        # Floor gate status indicator
+        can_adv=s.engine_can_adv if hasattr(s,"engine_can_adv") else self.game.engine.can_advance_floor()
+        fl_done=s.current_floor in s.floor_task_done
+        status_col=C["accent3"] if fl_done else C["warn"]
+        status_txt="✓ Floor task complete — ready to advance" if fl_done else "⚠  Complete the floor mini-task before advancing"
+        _draw_text(surf,status_txt,(W//2,70),"small",status_col,"center")
+
+        pygame.draw.line(surf,C["border"],(30,88),(W-30,88),1)
+        map_rect=pygame.Rect(22,96,320,445)
+        self.school_map.draw(surf,s.current_floor,map_rect,s.visited_floors,s.floor_task_done)
+        bar_r=pygame.Rect(28,546,308,10)
+        _draw_sus_bar(surf,bar_r,min(100,int(s.clues_total/s.clues_needed*100)),C["accent3"])
+        _draw_text(surf,f"Evidence: {s.clues_total}/{s.clues_needed}",(28,560),"tiny",C["text3"])
+
+        rx=360; _draw_text(surf,"ROSTER",(rx,96),"small",C["text3"])
+        pygame.draw.line(surf,C["border"],(rx,114),(W-22,114),1)
+        CARD_H=78
+        for i,player in enumerate(s.living_players()):
+            cy=122+i*(CARD_H+7); cr=pygame.Rect(rx,cy,W-rx-22,CARD_H)
+            _draw_panel(surf,cr,C["surface2"] if player.is_human else C["surface"])
+            bob=math.sin(self._bt*1.5)*2 if player.is_human else 0
+            an=get_anim(player.name)
+            SpriteFactory.draw_character(surf,player.sprite_cfg,cr.x+6,cr.y+3,height=64,
+                                         highlight=player.is_human,bob_offset=bob,anim=an,
+                                         show_aura=True,sus=player.suspicion)
+            nc=C["accent"] if player.is_human else C["text"]
+            _draw_text(surf,("▶ " if player.is_human else "")+player.name,(cr.x+86,cy+8),"body",nc)
+            _draw_text(surf,"(you)" if player.is_human else "NPC",(cr.x+86,cy+28),"tiny",C["text3"])
+            sus=player.suspicion; sc=(C["accent3"] if sus<30 else C["warn"] if sus<60 else C["red"])
+            br2=pygame.Rect(cr.x+86,cy+48,cr.w-96,8)
+            _draw_sus_bar(surf,br2,sus,sc)
+            _draw_text(surf,f"Sus {sus}%",(cr.right-6,cy+44),"tiny",sc,"right")
+        ep=[p for p in s.players if not p.alive]
+        if ep:
+            ey=122+len(s.living_players())*(CARD_H+7)+6
+            _draw_text(surf,"Ejected:",(rx,ey),"small",C["text3"]); ey+=16
+            for p in ep:
+                col=C["accent2"] if p.is_imposter() else C["text3"]
+                _draw_text(surf,f"  {p.name}  [{'✓ imp' if p.is_imposter() else '✗ innocent'}]",
+                           (rx,ey),"small",col); ey+=16
+
+        pygame.draw.line(surf,C["border"],(30,H-92),(W-30,H-92),1)
+        self.btn_proceed.draw(surf)
+        self.btn_customize.draw(surf)
+        self.btn_quit.draw(surf)
+        if self._show_gate:
+            _draw_floor_gate_notice(surf,s.current_floor)
+
+
+class FloorScene:
+    PHASES={1:"Trust Phase",2:"Trust Phase",3:"Trust Phase",
+            4:"Doubt Phase",5:"Doubt Phase",6:"Doubt Phase",
+            7:"Paranoia Phase",8:"Paranoia Phase",9:"No One Is Safe",10:"No One Is Safe"}
+    def __init__(self,game):
+        self.game=game; self._bt=0.0; self.school_map=SchoolMap()
+        self._arch=SchoolArchitecture()
+        s=game.engine.state
+        self.task_buttons=[]
+        for i in range(len(s.current_tasks)):
+            by=142+i*150
+            self.task_buttons.append(Button((380,by+100,min(W-408,380),38),
+                                            f"Attempt: {s.current_tasks[i].title}",
+                                            "primary","body","task"))
+    def handle_event(self,event):
+        s=self.game.engine.state
+        for i,btn in enumerate(self.task_buttons):
+            if btn.handle_event(event,self.game.sound,self.game.particles):
+                chosen=s.current_tasks[i]
+                self.game.after_delay(340,lambda c=chosen:self._attempt(c))
+    def _attempt(self,chosen):
+        s=self.game.engine.state; eng=self.game.engine; results=[]
+        for task in s.current_tasks:
+            result,msg=eng.resolve_task(task); results.append((task,result,msg))
+            snd="success" if result==TaskResult.SUCCESS else "sabotage"
+            self.game.sound.play(snd)
+            if result==TaskResult.SABOTAGED: self.game.particles.spawn_suspicion_pulse(W//2,H//2)
+        self.game.task_results=results; self.game.chosen_task=chosen
+        self.game.switch_scene("task_result")
+    def update(self,dt):
+        self._bt+=dt; self._arch.update(dt,self.game.engine.state.current_floor)
+        update_all_anims(dt,self.game.engine.state)
+    def draw(self,surf):
+        self._arch.draw(surf,self.game.engine.state.current_floor,alpha_overlay=175)
+        s=self.game.engine.state
+        _draw_text(surf,f"FLOOR {s.current_floor}",(W//2,14),"big",C["accent"],"center")
+        _draw_text(surf,self.PHASES.get(s.current_floor,""),(W//2,68),"small",C["text3"],"center")
+        _draw_text(surf,"Choose a task to attempt personally.",(W//2,90),"body",C["text2"],"center")
+        pygame.draw.line(surf,C["border"],(30,116),(W-30,116),1)
+        self.school_map.draw(surf,s.current_floor,pygame.Rect(22,126,318,395),
+                             s.visited_floors,s.floor_task_done)
+        for i,task in enumerate(s.current_tasks):
+            ty=142+i*150; cr=pygame.Rect(378,ty,W-406,144)
+            _draw_panel(surf,cr,C["surface2"] if task.tragic else C["surface"])
+            if task.tragic: _draw_text(surf,"⚠ TRAGIC",(cr.right-8,ty+7),"tiny",C["warn"],"right")
+            _draw_text(surf,task.title,(378+11,ty+7),"head",C["warn"] if task.tragic else C["text"])
+            _draw_text(surf,f"[{task.location}]",(378+11,ty+30),"small",C["text3"])
+            for d in range(5): pygame.draw.circle(surf,C["accent"] if d<task.difficulty else C["border"],(378+11+d*14,ty+52),4)
+            _draw_text(surf,f"+{task.clues_reward} clues",(378+84,ty+46),"tiny",C["accent3"])
+            _draw_text(surf,task.description,(378+11,ty+66),"small",C["text2"],max_width=cr.w-22)
+            self.task_buttons[i].draw(surf)
+        pygame.draw.line(surf,C["border"],(30,H-54),(W-30,H-54),1)
+        fl_done=s.current_floor in s.floor_task_done
+        gate_col=C["accent3"] if fl_done else C["warn"]
+        gate_msg="✓ Mini-task done" if fl_done else "⚠ Mini-task required to advance"
+        _draw_text(surf,f"Clues: {s.clues_total}/{s.clues_needed}  ·  Floor {s.current_floor}/{s.total_floors}  ·  {gate_msg}",
+                   (W//2,H-40),"small",gate_col,"center")
+
+
+class TaskResultScene:
+    def __init__(self,game):
+        self.game=game; cx=W//2
+        self.btn_vote=Button((cx-270,H-80,250,48),"Call Emergency Vote","warn","head","vote")
+        self.btn_minitask=Button((cx+20,H-80,250,48),"Floor Mini-Task  ★","success","head","task")
+
+    def handle_event(self,event):
+        if self.btn_vote.handle_event(event,self.game.sound,self.game.particles):
+            self.game.engine.state.phase="vote"
+            self.game.after_delay(300,lambda:self.game.switch_scene("vote"))
+        if self.btn_minitask.handle_event(event,self.game.sound,self.game.particles):
+            self.game.after_delay(300,lambda:self.game.switch_scene("mini_task"))
+
+    def update(self,dt): pass
+
+    def draw(self,surf):
+        surf.fill(C["bg"]); s=self.game.engine.state
+        results=getattr(self.game,"task_results",[]); chosen=getattr(self.game,"chosen_task",None)
+        _draw_text(surf,"FLOOR REPORT",(W//2,20),"head",C["accent"],"center")
+        _draw_text(surf,f"Floor {s.current_floor} — Task outcomes",(W//2,50),"small",C["text3"],"center")
+        pygame.draw.line(surf,C["border"],(40,74),(W-40,74),1)
+        CARD_H=138
+        for i,(task,result,msg) in enumerate(results):
+            cy=86+i*(CARD_H+10); cr=pygame.Rect(55,cy,W-110,CARD_H)
+            is_sab=(result==TaskResult.SABOTAGED)
+            bc=C["red"] if is_sab else C["accent3"]
+            _draw_panel(surf,cr,C["surface2"] if is_sab else C["surface"])
+            pygame.draw.rect(surf,bc,cr,2,border_radius=8)
+            _draw_text(surf,"✗ SABOTAGED" if is_sab else "✓ SUCCESS",(cr.right-12,cy+8),"body",bc,"right")
+            you=("  ← YOUR TASK" if task==chosen else "")
+            _draw_text(surf,task.title+you,(cr.x+12,cy+8),"head",C["accent"] if task==chosen else C["text"])
+            _draw_text(surf,f"[{task.location}]",(cr.x+12,cy+34),"small",C["text3"])
+            _draw_text(surf,msg,(cr.x+12,cy+58),"body",C["text2"],max_width=cr.w-24)
+        pygame.draw.line(surf,C["border"],(40,H-112),(W-40,H-112),1)
+        _draw_text(surf,f"Total clues: {s.clues_total}/{s.clues_needed}",(W//2,H-102),"head",C["accent3"],"center")
+        fl_done=s.current_floor in s.floor_task_done
+        notice=("✓ Mini-task done — you may vote or advance."
+                if fl_done else
+                "⚠  You must complete the Floor Mini-Task before advancing.")
+        _draw_text(surf,notice,(W//2,H-74),"small",C["accent3"] if fl_done else C["warn"],"center")
+        self.btn_vote.draw(surf)
+        self.btn_minitask.draw(surf)
+
+
+class VoteScene:
+    def __init__(self,game):
+        self.game=game; self._bt=0.0; self._build()
+    def _build(self):
+        s=self.game.engine.state
+        living=[p for p in s.living_players() if not p.is_human]
+        self.vote_buttons=[]
+        for i,player in enumerate(living):
+            btn=Button((W-272,142+i*92+22,228,40),
+                       f"Vote out {player.name.split()[0]}","danger","body","vote")
+            self.vote_buttons.append((player,btn))
+        self.btn_skip=Button((W//2-115,H-72,230,42),"Skip — don't vote","ghost","body","ui")
+    def handle_event(self,event):
+        for player,btn in self.vote_buttons:
+            if btn.handle_event(event,self.game.sound,self.game.particles):
+                self.game.after_delay(350,lambda p=player:self._cast(p))
+        if self.btn_skip.handle_event(event,self.game.sound,self.game.particles):
+            self.game.after_delay(300,self._skip)
+    def _cast(self,target):
+        eng=self.game.engine; s=eng.state; human=s.human_player()
+        npc_v=eng.run_npc_votes(); all_v={**npc_v}
+        if human: all_v[human.name]=target.name
+        ejected=eng.resolve_vote(all_v); self._show(ejected,all_v)
+    def _skip(self):
+        npc_v=self.game.engine.run_npc_votes()
+        ejected=self.game.engine.resolve_vote(npc_v); self._show(ejected,npc_v)
+    def _show(self,ejected,all_votes):
+        s=self.game.engine.state
+        if ejected:
+            ep=next((p for p in s.players if p.name==ejected),None)
+            was_imp=ep and ep.is_imposter()
+            self.game.pending_eject={"name":ejected,"was_imp":was_imp,"votes":all_votes}
+            self.game.sound.play("eject_good" if was_imp else "eject_bad")
+            self.game.particles.spawn_eject(W//2,H//2,was_imp)
+        else:
+            self.game.pending_eject={"name":None,"was_imp":False,"votes":all_votes}
+        win=self.game.engine.check_win()
+        if win is not None: self.game.after_delay(800,lambda:self.game.switch_scene("result"))
+        else: self.game.after_delay(800,lambda:self.game.switch_scene("task_result"))
+    def update(self,dt): self._bt+=dt; update_all_anims(dt,self.game.engine.state)
+    def draw(self,surf):
+        surf.fill(C["bg"]); s=self.game.engine.state
+        _draw_text(surf,"EMERGENCY VOTE",(W//2,18),"title",C["warn"],"center")
+        _draw_text(surf,"Who is working for the school?",(W//2,70),"body",C["text2"],"center")
+        _draw_text(surf,"(Ties result in no ejection — which is also someone's plan.)",(W//2,94),"small",C["text3"],"center")
+        pygame.draw.line(surf,C["border"],(40,118),(W-40,118),1)
+        for i,(player,btn) in enumerate(self.vote_buttons):
+            cy=142+i*92; cr=pygame.Rect(36,cy,W-72,84)
+            _draw_panel(surf,cr,C["surface"])
+            bob=math.sin(self._bt*1.2+i)*2; an=get_anim(player.name)
+            SpriteFactory.draw_character(surf,player.sprite_cfg,cr.x+6,cr.y+3,height=64,
+                                         bob_offset=bob,anim=an,show_aura=True,sus=player.suspicion)
+            _draw_text(surf,player.name,(cr.x+88,cy+8),"head",C["text"])
+            sus=player.suspicion; sc=(C["accent3"] if sus<30 else C["warn"] if sus<60 else C["red"])
+            _draw_text(surf,f"Suspicion: {sus}%",(cr.x+88,cy+34),"small",sc)
+            br2=pygame.Rect(cr.x+88,cy+54,310,7); _draw_sus_bar(surf,br2,sus,sc)
+            flavor=next((n.get("flavor","") for n in NPC_SPRITES if n.get("name")==player.name),"")
+            if flavor: _draw_text(surf,flavor,(cr.x+88,cy+64),"tiny",C["text3"])
+            btn.draw(surf)
+        pygame.draw.line(surf,C["border"],(40,H-82),(W-40,H-82),1)
+        self.btn_skip.draw(surf)
+        pe=getattr(self.game,"pending_eject",None)
+        if pe and pe.get("name"):
+            bc=C["accent3"] if pe["was_imp"] else C["red"]
+            msg=(f"{pe['name']} ejected — WAS imposter ✓" if pe["was_imp"]
+                 else f"{pe['name']} ejected — NOT imposter ✗")
+            _draw_panel(surf,pygame.Rect(W//2-260,H//2-32,520,64),bc,radius=12,alpha=215)
+            _draw_text(surf,msg,(W//2,H//2-14),"head",C["white"],"center")
+
+
+class ResultScene:
+    def __init__(self,game):
+        self.game=game; self._t=0.0
+        self.btn_replay=Button((W//2-145,H-72,290,48),"Play Again","primary","head","nav")
+        s=game.engine.state
+        game.sound.play("win" if s.students_win else "lose",0.7)
+    def handle_event(self,event):
+        if self.btn_replay.handle_event(event,self.game.sound,self.game.particles):
+            self.game.after_delay(400,lambda:self.game.switch_scene("title"))
+    def update(self,dt):
+        self._t+=dt
+        if random.random()<0.09:
+            s=self.game.engine.state
+            self.game.particles.spawn_float(random.randint(100,W-100),H-20,
+                                            C["accent3"] if s.students_win else C["red"])
+    def draw(self,surf):
+        surf.fill(C["bg"]); s=self.game.engine.state
+        if s.students_win:
+            banner="BLACKWELL EXPOSED"; bc=C["accent3"]
+            sub=(f"You found {s.clues_total} clues and survived {s.current_floor} floors.\n"
+                 "The truth is out. The school is unbothered.\nIt's been here before.")
+        else:
+            banner="THE SCHOOL WINS"; bc=C["red"]
+            sub=("The school has noticed your progress.\nThe school is unbothered.\nThe school was here before you.")
+        pulse=abs(math.sin(self._t*2))*7
+        _draw_text(surf,banner,(W//2,int(24+pulse)),"big",bc,"center")
+        _draw_text(surf,sub,(W//2,96),"body",C["text2"],"center")
+        pygame.draw.line(surf,C["border"],(40,168),(W-40,168),1)
+        _draw_text(surf,"ROLE REVEAL",(W//2,178),"small",C["text3"],"center")
+        for i,player in enumerate(s.players):
+            ry=202+i*56; cr=pygame.Rect(55,ry,W-110,48)
+            _draw_panel(surf,cr,C["surface2"] if player.is_imposter() else C["surface"])
+            SpriteFactory.draw_character(surf,player.sprite_cfg,cr.x+5,cr.y+2,height=42,dead=not player.alive)
+            nm=player.name+("  ← you" if player.is_human else "")+("  [ejected]" if not player.alive else "")
+            _draw_text(surf,nm,(cr.x+56,ry+7),"body",C["text"])
+            rc=C["red"] if player.is_imposter() else C["accent3"]
+            _draw_text(surf,"IMPOSTER" if player.is_imposter() else "student",(cr.right-10,ry+10),"head",rc,"right")
+        log_y=202+len(s.players)*56+8
+        pygame.draw.line(surf,C["border"],(40,log_y),(W-40,log_y),1)
+        _draw_text(surf,"GAME LOG",(58,log_y+7),"small",C["text3"])
+        for j,entry in enumerate(s.log[-8:]):
+            _draw_text(surf,entry,(58,log_y+24+j*15),"tiny",C["text3"])
+        pygame.draw.line(surf,C["border"],(40,H-82),(W-40,H-82),1)
+        self.btn_replay.draw(surf)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN GAME
+# ═══════════════════════════════════════════════════════════════════════
+
+class Game:
+    SCENE_MAP={
+        "title":       TitleScene,
+        "lobby":       LobbyScene,
+        "floor":       FloorScene,
+        "task_result": TaskResultScene,
+        "vote":        VoteScene,
+        "result":      ResultScene,
+        "mini_task":   MiniTaskScene,
+        "customize":   CustomizeScene,
+    }
+
+    def __init__(self):
+        pygame.mixer.pre_init(SR,-16,1,512); pygame.init()
+        self.screen=pygame.display.set_mode((W,H))
+        pygame.display.set_caption(TITLE)
+        self.clock=pygame.time.Clock()
+        self._init_fonts()
+        self.sound=SoundEngine(); self.particles=ParticleSystem()
+        self.engine=GameEngine(); self.transition=Transition()
+        self.task_results=[]; self.chosen_task=None; self.pending_eject=None
+        self.human_config=dict(DEFAULT_PLAYER_CONFIG)
+        self._deferred:List[Tuple[float,Any]]=[]
+        self.scene=None
+        self.switch_scene("title")
+        self.sound.start_music()
+
+    def _init_fonts(self):
+        try:
+            fn=pygame.font.match_font("couriernew,courier,freemono,monospace")
+            sizes={"tiny":11,"small":13,"body":15,"head":19,"title":27,"big":44}
+            for k,sz in sizes.items(): FONTS[k]=pygame.font.Font(fn,sz)
+        except Exception:
+            d=pygame.font.get_default_font()
+            for k,sz in [("tiny",11),("small",13),("body",15),("head",19),("title",27),("big",44)]:
+                FONTS[k]=pygame.font.Font(d,sz)
+
+    def switch_scene(self,name:str):
+        self.transition.start()
+        cls=self.SCENE_MAP.get(name,TitleScene)
+        self.scene=cls(self)
+
+    def after_delay(self,ms:int,fn):
+        self._deferred.append((time.time()+ms/1000.0,fn))
+
+    def quit(self): pygame.quit(); raise SystemExit
+
+    def run(self):
+        running=True
+        while running:
+            dt=self.clock.tick(FPS)/1000.0
+            for event in pygame.event.get():
+                if event.type==pygame.QUIT: running=False
+                elif event.type==pygame.KEYDOWN:
+                    if event.key==pygame.K_ESCAPE: running=False
+                    elif self.scene: self.scene.handle_event(event)
+                elif self.scene: self.scene.handle_event(event)
+            now=time.time(); rem=[]
+            for at,fn in self._deferred:
+                if now>=at:
+                    try: fn()
+                    except Exception: pass
+                else: rem.append((at,fn))
+            self._deferred=rem
+            if self.scene: self.scene.update(dt)
+            self.particles.update(); self.transition.update(dt)
+            if self.scene: self.scene.draw(self.screen)
+            self.particles.draw(self.screen)
+            self.transition.draw(self.screen)
+            pygame.display.flip()
+        pygame.quit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════
+
+if __name__=="__main__":
+    game=Game(); game.run()
